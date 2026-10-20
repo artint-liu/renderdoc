@@ -841,22 +841,6 @@
        </widget>
       </item>
       <item>
-       <widget class="QPushButton" name="loadLastCapture">
-        <property name="sizePolicy">
-         <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
-          <horstretch>0</horstretch>
-          <verstretch>0</verstretch>
-         </sizepolicy>
-        </property>
-        <property name="toolTip">
-         <string>Load the most recently used capture settings</string>
-        </property>
-        <property name="text">
-         <string>Load Last Settings</string>
-        </property>
-       </widget>
-      </item>
-      <item>
        <spacer name="buttonsSpace">
         <property name="orientation">
          <enum>Qt::Horizontal</enum>
@@ -883,6 +867,35 @@
        </widget>
       </item>
      </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QLabel" name="recentSettingsLabel">
+     <property name="text">
+      <string>Recent Settings</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QListWidget" name="recentSettingsList">
+     <property name="toolTip">
+      <string>Recently used capture settings, newest first. Click an entry to load it.</string>
+     </property>
+     <property name="maximumSize">
+      <size>
+       <width>16777215</width>
+       <height>120</height>
+      </size>
+     </property>
+     <property name="alternatingRowColors">
+      <bool>true</bool>
+     </property>
+     <property name="selectionMode">
+      <enum>QAbstractItemView::SingleSelection</enum>
+     </property>
+     <property name="uniformItemSizes">
+      <bool>true</bool>
+     </property>
     </widget>
    </item>
    <item>

@@ -97,47 +97,92 @@ QString CaptureDialog::mostRecentFilename()
   return ConfigFilePath(lit("most_recent.cap"));
 }
 
-void CaptureDialog::PopulateMostRecent()
+QString CaptureDialog::recentFilename(int idx)
 {
-  QString filename = mostRecentFilename();
+  if(idx <= 0)
+    return mostRecentFilename();
 
-  if(QFile::exists(filename))
+  return ConfigFilePath(lit("recent_%1.cap").arg(idx, 2, 10, QLatin1Char('0')));
+}
+
+static bool SettingsIdentical(const CaptureSettings &a, const CaptureSettings &b)
+{
+  return (QVariant)a == (QVariant)b;
+}
+
+static QString ExeDisplayName(QString exe)
+{
+  // if the executable isn't a path, display the full name
+  bool fullName = (exe.indexOf(QLatin1Char('/')) < 0 && exe.indexOf(QLatin1Char('\\')) < 0);
+
+  // if it's not a windows path and only contains one '/', it's an android package so also
+  // display the full name
+  fullName |= (exe.indexOf(QLatin1Char('\\')) < 0 && exe.count(QLatin1Char('/')) == 1);
+
+  if(!fullName)
   {
-    CaptureSettings settings = LoadSettingsFromDisk(filename);
-
-    if(!settings.executable.isEmpty())
-    {
-      ui->loadLastCapture->setEnabled(true);
-
-      QString exe = settings.executable;
-
-      // if the executable isn't a path, display the full name
-      bool fullName = (exe.indexOf(QLatin1Char('/')) < 0 && exe.indexOf(QLatin1Char('\\')) < 0);
-
-      // if it's not a windows path and only contains one '/', it's an android package so also
-      // display the full name
-      fullName |= (exe.indexOf(QLatin1Char('\\')) < 0 && exe.count(QLatin1Char('/')) == 1);
-
-      if(fullName)
-      {
-        ui->loadLastCapture->setText(tr("Load Last Settings - %1").arg(exe));
-      }
-      else
-      {
-        int offs = exe.lastIndexOf(QLatin1Char('\\'));
-        if(offs > 0)
-          exe.remove(0, offs + 1);
-        offs = exe.lastIndexOf(QLatin1Char('/'));
-        if(offs > 0)
-          exe.remove(0, offs + 1);
-        ui->loadLastCapture->setText(tr("Load Last Settings - %1").arg(exe));
-      }
-      return;
-    }
+    int offs = exe.lastIndexOf(QLatin1Char('\\'));
+    if(offs > 0)
+      exe.remove(0, offs + 1);
+    offs = exe.lastIndexOf(QLatin1Char('/'));
+    if(offs > 0)
+      exe.remove(0, offs + 1);
   }
 
-  ui->loadLastCapture->setEnabled(false);
-  ui->loadLastCapture->setText(tr("Load Last Settings"));
+  return exe;
+}
+
+void CaptureDialog::PopulateMostRecent()
+{
+  // rebuild the list without triggering itemClicked loads
+  ui->recentSettingsList->blockSignals(true);
+  ui->recentSettingsList->clear();
+
+  QList<QVariant> seen;
+
+  for(int i = 0; i < NUM_RECENT_SETTINGS; i++)
+  {
+    QString filename = recentFilename(i);
+
+    if(!QFile::exists(filename))
+      continue;
+
+    CaptureSettings settings = LoadSettingsFromDisk(filename, true);
+
+    if(settings.executable.isEmpty())
+      continue;
+
+    // skip entries that are identical to one already displayed
+    QVariant ident = (QVariant)settings;
+
+    bool duplicate = false;
+    for(const QVariant &prev : seen)
+    {
+      if(prev == ident)
+      {
+        duplicate = true;
+        break;
+      }
+    }
+
+    if(duplicate)
+      continue;
+
+    seen.push_back(ident);
+
+    QListWidgetItem *item =
+        new QListWidgetItem(tr("%1. %2").arg(seen.count()).arg(ExeDisplayName(settings.executable)));
+    item->setToolTip(settings.executable);
+    item->setData(Qt::UserRole, filename);
+    ui->recentSettingsList->addItem(item);
+  }
+
+  ui->recentSettingsList->blockSignals(false);
+
+  // hide entirely when there are no recent settings, so no space is wasted
+  bool empty = ui->recentSettingsList->count() == 0;
+  ui->recentSettingsLabel->setVisible(!empty);
+  ui->recentSettingsList->setVisible(!empty);
 }
 
 CaptureDialog::CaptureDialog(ICaptureContext &ctx, OnCaptureMethod captureCallback,
@@ -892,9 +937,15 @@ void CaptureDialog::on_loadSettings_clicked()
   }
 }
 
-void CaptureDialog::on_loadLastCapture_clicked()
+void CaptureDialog::on_recentSettingsList_itemClicked(QListWidgetItem *item)
 {
-  LoadSettings(mostRecentFilename());
+  if(!item)
+    return;
+
+  QString filename = item->data(Qt::UserRole).toString();
+
+  if(!filename.isEmpty())
+    LoadSettings(filename);
 }
 
 void CaptureDialog::on_launch_clicked()
@@ -1092,7 +1143,7 @@ void CaptureDialog::LoadSettings(const rdcstr &filename)
   SetSettings(LoadSettingsFromDisk(filename));
 }
 
-CaptureSettings CaptureDialog::LoadSettingsFromDisk(const rdcstr &filename)
+CaptureSettings CaptureDialog::LoadSettingsFromDisk(const rdcstr &filename, bool silent)
 {
   QFile f(filename);
   if(f.open(QIODevice::ReadOnly | QIODevice::Text))
@@ -1105,13 +1156,13 @@ CaptureSettings CaptureDialog::LoadSettingsFromDisk(const rdcstr &filename)
     {
       return CaptureSettings(values[lit("settings")]);
     }
-    else
+    else if(!silent)
     {
       RDDialog::critical(this, tr("Error loading config"),
                          tr("Couldn't interpret settings in %1.").arg(filename));
     }
   }
-  else
+  else if(!silent)
   {
     RDDialog::critical(this, tr("Error loading config"), tr("Couldn't open path %1.").arg(filename));
   }
@@ -1239,7 +1290,28 @@ ICaptureConnection *CaptureDialog::Launch()
 
     QString cmdLine = GetCommandLine();
 
-    SaveSettings(mostRecentFilename());
+    // avoid duplicate history entries: if nothing changed since the last launch, don't rotate a
+    // copy of most_recent.cap into the history
+    CaptureSettings newSettings = Settings();
+
+    if(!SettingsIdentical(newSettings, LoadSettingsFromDisk(mostRecentFilename(), true)))
+    {
+      // rotate the history: most_recent -> recent_01 -> ... -> recent_09, the oldest is dropped
+      for(int i = NUM_RECENT_SETTINGS - 1; i >= 1; i--)
+      {
+        QString src = (i == 1) ? mostRecentFilename() : recentFilename(i - 1);
+        QString dst = recentFilename(i);
+
+        if(QFile::exists(dst))
+          QFile::remove(dst);
+        if(QFile::exists(src))
+          QFile::rename(src, dst);
+      }
+
+      // most_recent.cap keeps its name, location and format so that older versions of RenderDoc
+      // can still load the last settings
+      SaveSettings(mostRecentFilename());
+    }
 
     PopulateMostRecent();
 

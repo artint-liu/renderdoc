@@ -36,6 +36,7 @@ class CaptureDialog;
 class QStandardItemModel;
 class MainWindow;
 class RDLabel;
+class QListWidgetItem;
 
 class CaptureDialog : public QFrame, public ICaptureDialog
 {
@@ -96,7 +97,7 @@ private slots:
 
   void on_saveSettings_clicked();
   void on_loadSettings_clicked();
-  void on_loadLastCapture_clicked();
+  void on_recentSettingsList_itemClicked(QListWidgetItem *item);
 
   void on_launch_clicked();
 
@@ -127,9 +128,13 @@ private:
   void initWarning(RDLabel *label);
 
   QString mostRecentFilename();
+  QString recentFilename(int idx);
 
   void PopulateMostRecent();
-  CaptureSettings LoadSettingsFromDisk(const rdcstr &filename);
+  CaptureSettings LoadSettingsFromDisk(const rdcstr &filename, bool silent = false);
+
+  // most_recent.cap plus NUM_RECENT_SETTINGS - 1 history slots
+  static const int NUM_RECENT_SETTINGS = 10;
 
   void CheckAndroidSetup(QString &filename);
   AndroidFlags m_AndroidFlags;
