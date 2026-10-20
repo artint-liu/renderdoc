@@ -1,0 +1,9 @@
+{
+    "extension_api": 1,
+    "name": "RenderDoc MCP Server",
+    "version": "0.1.0",
+    "minimum_renderdoc": "1.6",
+    "description": "Exposes an MCP (Model Context Protocol) server over local HTTP, allowing AI Agents to inspect the capture currently open in this RenderDoc instance: drawcall list, pipeline state, screenshots, pixel history, shader disassembly, buffers and debug messages.",
+    "author": "",
+    "url": ""
+}
