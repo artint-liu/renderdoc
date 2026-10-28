@@ -182,12 +182,18 @@ class RemoteSpoke(object):
 
 class Broker(object):
     def __init__(self, http_port=30007, reg_port=30008, log_cb=None,
-                 name="renderdoc-mcp", version="0.2.0"):
+                 name="renderdoc-mcp", version="0.2.0", rd_exe=None,
+                 rd_exe_source=None):
         self._http_port = http_port
         self._reg_port = reg_port
         self._log = log_cb if log_cb is not None else (lambda m: None)
         self._name = name
         self._version = version
+        # qrenderdoc.exe to launch, fixed at startup: --exe arg > env var
+        # (see rdmcp_broker.py); the RD-hosted broker falls back to the
+        # hosting qrenderdoc when neither is set (try_host_broker)
+        self._rd_exe = rd_exe
+        self._rd_exe_source = rd_exe_source
         self._spokes = {}          # id -> LocalSpoke | RemoteSpoke
         self._lock = threading.RLock()
         self._next_id = 1
@@ -196,7 +202,6 @@ class Broker(object):
         self._reg_thread = None
         self._stop = False
         self._mutex = None
-        self._last_rd_exe = None
         self._call_timeout = _env_float("RENDERDOC_MCP_CALL_TIMEOUT", 300.0)
         self._status_timeout = _env_float("RENDERDOC_MCP_STATUS_TIMEOUT", 8.0)
 
@@ -445,21 +450,20 @@ class Broker(object):
             out.update(s.describe())
             out.update(st)
             instances.append(out)
-        return tool_defs.text_result({
-            "endpoint": self.url,
-            "broker_pid": os.getpid(),
-            "instances": instances})
+        out = {"endpoint": self.url,
+               "broker_pid": os.getpid(),
+               "rd_exe": self._rd_exe,
+               "rd_exe_source": self._rd_exe_source,
+               "instances": instances}
+        return tool_defs.text_result(out)
 
     def _tool_start_renderdoc(self, args):
-        exe = args.get("exe") or os.environ.get("RENDERDOC_MCP_RD_EXE") \
-            or self._last_rd_exe
-        if not exe:
+        if not self._rd_exe:
             raise BrokerError(
-                "No qrenderdoc path known. Pass 'exe' (e.g. "
-                "C:\\Program Files\\RenderDoc\\qrenderdoc.exe) or set the "
+                "No qrenderdoc exe configured. Restart the broker with "
+                "--exe <path to qrenderdoc.exe> or set the "
                 "RENDERDOC_MCP_RD_EXE environment variable.")
-        if not os.path.isfile(exe):
-            raise BrokerError("qrenderdoc.exe not found: %s" % exe)
+        exe = self._rd_exe
         workdir = args.get("working_dir") or None
         extra = args.get("args") or ""
         wait_seconds = _env_float2(args.get("wait_seconds"), 45.0)
@@ -468,8 +472,8 @@ class Broker(object):
         child_env = {"RENDERDOC_MCP_PORT": str(self._http_port),
                      "RENDERDOC_MCP_REG_PORT": str(self._reg_port)}
         pid = winprocess.spawn(exe, extra, workdir, extra_env=child_env)
-        self._last_rd_exe = exe
-        out = {"started": True, "pid": pid, "exe": exe, "endpoint": self.url}
+        out = {"started": True, "pid": pid, "exe": exe,
+               "exe_source": self._rd_exe_source, "endpoint": self.url}
         if wait_seconds > 0:
             deadline = time.time() + wait_seconds
             found = None
@@ -508,7 +512,18 @@ def try_host_broker(http_port, reg_port, log_cb, host_meta=None,
                     host_dispatch=None, host_status=None):
     """Try to become the system's MCP broker. Returns (broker, None) on
     success or (None, reason) when another broker exists / ports are busy."""
-    b = Broker(http_port, reg_port, log_cb=log_cb)
+    # RD-hosted broker has no CLI arg: RENDERDOC_MCP_RD_EXE env, else the
+    # hosting qrenderdoc.exe itself (same build => has the extension)
+    rd_exe = os.environ.get("RENDERDOC_MCP_RD_EXE")
+    rd_exe_source = None
+    if rd_exe:
+        rd_exe_source = "env"
+    else:
+        rd_exe = (host_meta or {}).get("exe")
+        if rd_exe:
+            rd_exe_source = "host"
+    b = Broker(http_port, reg_port, log_cb=log_cb, rd_exe=rd_exe,
+               rd_exe_source=rd_exe_source)
     try:
         b.start()
     except BrokerError as e:

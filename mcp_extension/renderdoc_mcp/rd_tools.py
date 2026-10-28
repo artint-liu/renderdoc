@@ -683,6 +683,42 @@ def get_debug_messages(args):
     return _text_result({"count": len(msgs), "messages": msgs})
 
 
+def current_status():
+    """Cheap, exception-safe status dict for list_instances /
+    get_current_state. No replay-thread round-trip: only reads UI state, so
+    it is safe to call from broker/socket worker threads at any time."""
+    out = {}
+    if _instance_id:
+        out["instance"] = _instance_id
+    loaded = False
+    if _ctx is not None:
+        try:
+            loaded = bool(_ctx.IsCaptureLoaded())
+        except Exception:
+            loaded = False
+        try:
+            fn = str(_ctx.GetCaptureFilename())
+            if fn:
+                out["capture_filename"] = fn
+        except Exception:
+            pass
+        try:
+            out["selected_event"] = int(_ctx.CurEvent())
+        except Exception:
+            pass
+    out["capture_loaded"] = loaded
+    if _conn is not None:
+        try:
+            out["app_connected"] = bool(_conn.IsConnected())
+        except Exception:
+            out["app_connected"] = None
+        try:
+            out["num_captures"] = len(_conn.GetCaptures())
+        except Exception:
+            pass
+    return out
+
+
 def get_current_state(args):
     out = current_status()
     if not out.get("capture_loaded"):

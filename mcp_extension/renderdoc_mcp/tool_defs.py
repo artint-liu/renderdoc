@@ -192,20 +192,20 @@ BROKER_TOOL_NAMES = ("list_instances", "start_renderdoc")
 
 _BASE["list_instances"] = _def(
     "List every RenderDoc instance connected to this MCP broker with its "
-    "instance id, process id, executable and capture state. Call this first "
-    "when several RenderDoc windows may be running, then pass the chosen id "
-    "as the 'instance' argument of the other tools.",
+    "instance id, process id, executable and capture state. Also reports "
+    "'rd_exe': the qrenderdoc.exe path that start_renderdoc will launch "
+    "(fixed at broker startup). Call this first when several RenderDoc "
+    "windows may be running, then pass the chosen id as the 'instance' "
+    "argument of the other tools.",
     {"type": "object", "properties": {}})
 
 _BASE["start_renderdoc"] = _def(
-    "Start a new qrenderdoc.exe process; once its renderdoc_mcp extension "
-    "loads it registers with this broker as a new instance that can be "
-    "driven through the other tools. exe defaults to the "
-    "RENDERDOC_MCP_RD_EXE environment variable, then to the path used by "
-    "the previous successful call.",
+    "Start the qrenderdoc.exe configured at broker startup (--exe argument "
+    "or RENDERDOC_MCP_RD_EXE environment variable; the path is shown in "
+    "the broker startup log and in list_instances' rd_exe field). Once the "
+    "new process's renderdoc_mcp extension loads it registers with this "
+    "broker as a new instance that can be driven through the other tools.",
     {"type": "object", "properties": {
-        "exe": {"type": "string",
-                "description": "Path to qrenderdoc.exe"},
         "args": {"type": "string",
                  "description": "Optional extra command line for "
                                 "qrenderdoc.exe"},
