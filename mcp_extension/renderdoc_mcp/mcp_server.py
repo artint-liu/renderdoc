@@ -329,11 +329,16 @@ class MCPServer(object):
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": self._name, "version": self._version},
                 "instructions": (
-                    "This server exposes tools to inspect the capture "
-                    "currently open in a running RenderDoc UI instance. "
-                    "Start with get_capture_info / list_drawcalls, then use "
-                    "get_drawcall_params, get_screenshot, get_pixel_history "
-                    "and get_shader_disassembly to analyse specific events."),
+                    "RenderDoc MCP broker: one or more RenderDoc instances "
+                    "register here and every capture/analysis tool is routed "
+                    "to one of them. Call list_instances first, then pass "
+                    "the chosen id as the 'instance' argument of the other "
+                    "tools (omit it only when exactly one instance is "
+                    "connected). To debug a program: launch_app(exe=...) "
+                    "-> trigger_capture -> list_captures -> open_capture, "
+                    "then analyse with list_drawcalls, get_drawcall_params, "
+                    "get_screenshot, get_pixel_history and "
+                    "get_shader_disassembly."),
             }
         elif method == "ping":
             result = {}
@@ -365,6 +370,9 @@ class MCPServer(object):
                     "isError": True}
         try:
             content = tool["call"](args)
+            if isinstance(content, dict) and "content" in content:
+                # routers may pass through a full {content, isError} result
+                return content
             if isinstance(content, str):
                 content = [{"type": "text", "text": content}]
             if not isinstance(content, list):

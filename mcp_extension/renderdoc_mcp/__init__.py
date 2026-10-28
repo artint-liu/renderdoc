@@ -1,19 +1,23 @@
-"""RenderDoc MCP Server - UI extension.
+"""RenderDoc MCP extension - one MCP broker, many RenderDoc instances.
 
-Adds a 'Tools -> RenderDoc MCP Server' menu item. Selecting it opens a
-visible server window and starts a local MCP server that lets AI agents
-inspect the capture open in this RenderDoc instance.
+Every RenderDoc instance running this extension connects to the local MCP
+broker and registers as an instance ('rd1', 'rd2', ...). If no broker is
+running yet, the FIRST instance hosts it (or use the standalone
+rdmcp_broker.py BEFORE starting RenderDoc). When a broker's host disappears,
+another instance automatically takes over.
 
-Uniqueness: a Win32 named mutex (plus the port binding) guarantees only one
-server instance runs per system/port. A second RenderDoc instance will show
-'server already running' instead of starting a duplicate.
+AI agents talk to the broker over HTTP (http://127.0.0.1:<port>/mcp), call
+list_instances to see the connected RenderDocs, and target a specific one
+with the 'instance' argument of every capture/analysis tool.
 """
 import os
+import sys
+import traceback
 
 import qrenderdoc as qrd
 
 try:
-    from . import mcp_server, rd_tools
+    from . import mcp_server, rd_tools, spoke as spoke_mod
 except ImportError:
     # loaded outside the package context: add this file's directory to
     # sys.path and import the submodules as top-level modules
@@ -25,16 +29,20 @@ except ImportError:
         _sys.path.insert(0, _here)
     import mcp_server
     import rd_tools
+    import spoke as spoke_mod
 
+_VERSION = "0.2.0"
 _PORT = int(os.environ.get("RENDERDOC_MCP_PORT", "30007"))
-_MUTEX_NAME = "Local\\RenderDocMCP_%d" % _PORT
+_REG_PORT = int(os.environ.get("RENDERDOC_MCP_REG_PORT", str(_PORT + 1)))
+_REG_HOST = "127.0.0.1"
 
 _state = {
-    "server": None,       # mcp_server.MCPServer
-    "mutex": None,        # win32 HANDLE (or None on non-windows)
+    "spoke": None,        # spoke_mod.SpokeClient
+    "broker": None,       # broker.Broker when this process hosts it
+    "instance_id": None,
     "top": None,          # docked window widget
     "status_label": None,
-    "toggle_btn": None,   # Start/Stop toggle button
+    "toggle_btn": None,
     "log_box": None,
     "mqt": None,          # MiniQtHelper
 }
@@ -65,8 +73,7 @@ def _ui_log(msg):
     mqt.InvokeOntoUIThread(update)
 
 
-def _set_running_ui(running, status_msg):
-    """Update the status label and the toggle button (thread-safe)."""
+def _refresh_ui():
     mqt = _state["mqt"]
     if mqt is None:
         return
@@ -76,97 +83,115 @@ def _set_running_ui(running, status_msg):
         if m is None:
             return
         label = _state["status_label"]
-        if label is not None:
-            m.SetWidgetText(label, status_msg)
         btn = _state["toggle_btn"]
+        spoke = _state["spoke"]
+        broker = _state["broker"]
+        if spoke is None:
+            status = ("Status: STOPPED. Click 'Start Server' to connect to "
+                      "or host the MCP broker at http://127.0.0.1:%d/mcp"
+                      % _PORT)
+            btn_text = "Start Server"
+            running = False
+        elif broker is not None:
+            running = True
+            btn_text = "Stop Server"
+            status = ("Status: BROKER HOST %s\nThis RenderDoc is instance %s "
+                      "and serves every connected instance."
+                      % (broker.url, _state["instance_id"]))
+        else:
+            running = True
+            btn_text = "Disconnect"
+            status = ("Status: connected to broker as instance %s "
+                      "(endpoint http://127.0.0.1:%d/mcp)"
+                      % (_state["instance_id"], _PORT))
+        if label is not None:
+            m.SetWidgetText(label, status)
         if btn is not None:
-            m.SetWidgetText(btn, "Stop Server" if running else "Start Server")
+            m.SetWidgetText(btn, btn_text)
 
     mqt.InvokeOntoUIThread(update)
 
 
 # ---------------------------------------------------------------------------
-# process uniqueness via win32 named mutex
+# spoke dispatch/status glue
 # ---------------------------------------------------------------------------
 
-def _acquire_mutex():
-    if os.name != "nt":
-        return object()  # non-windows: rely on the port binding alone
+def _dispatch(tool, args):
+    """Run an instance-scoped tool of THIS RenderDoc. Never raises."""
+    fn = rd_tools.TOOL_IMPL.get(tool)
+    if fn is None:
+        return [{"type": "text", "text": "Unknown tool: %s" % tool}], True
     try:
-        import ctypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        handle = k32.CreateMutexW(None, False, _MUTEX_NAME)
-        if not handle:
-            return None
-        # ERROR_ALREADY_EXISTS == 183
-        if ctypes.get_last_error() == 183:
-            k32.CloseHandle(handle)
-            return None
-        return handle
+        content = fn(args)
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        return content, False
     except Exception as e:
-        _ui_log("[MCP] mutex unavailable (%s), falling back to port binding "
-                "for uniqueness" % e)
-        return object()
+        return ([{"type": "text",
+                  "text": "%s: %s\n%s" % (type(e).__name__, e,
+                                          traceback.format_exc())}], True)
 
 
-def _release_mutex():
-    mutex = _state["mutex"]
-    _state["mutex"] = None
-    if mutex is None or os.name != "nt":
-        return
+def _self_exe():
     try:
-        import ctypes
-        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(mutex)
+        return sys.executable or ""
     except Exception:
-        pass
+        return ""
+
+
+def _instance_meta():
+    return {"pid": os.getpid(), "exe": _self_exe(), "version": _VERSION,
+            "hostname": os.environ.get("COMPUTERNAME", "")}
+
+
+def _on_instance(iid, welcome):
+    _state["instance_id"] = iid
+    rd_tools.set_instance_id(iid)
+    _ui_log("[mcp] ready as instance %s" % iid)
+    _refresh_ui()
+
+
+def _on_hosted(broker):
+    _state["broker"] = broker
+    iid = broker.local_instance_id()
+    _state["instance_id"] = iid
+    rd_tools.set_instance_id(iid)
+    _refresh_ui()
+
+
+def _on_stopped():
+    _state["broker"] = None
+    _state["instance_id"] = None
+    rd_tools.set_instance_id(None)
+    _refresh_ui()
 
 
 # ---------------------------------------------------------------------------
-# server lifecycle
+# role lifecycle
 # ---------------------------------------------------------------------------
 
-def _start_server():
-    if _state["server"] is not None:
-        _ui_log("[MCP] server already running")
+def _start_role():
+    if _state["spoke"] is not None:
+        _ui_log("[mcp] already running")
         return
-    mutex = _acquire_mutex()
-    if mutex is None:
-        _ui_log("[MCP] another RenderDoc MCP Server instance is already "
-                "running on this machine (port %d). Not starting a "
-                "duplicate." % _PORT)
-        _set_running_ui(False, "Status: another instance is already running "
-                               "on port %d. Close it there first." % _PORT)
-        return
-    try:
-        srv = mcp_server.MCPServer(rd_tools.TOOLS, log_cb=_ui_log,
-                                   port=_PORT)
-        srv.start()
-    except OSError as e:
-        _release_mutex()
-        _ui_log("[MCP] failed to bind port %d: %s" % (_PORT, e))
-        _set_running_ui(False, "Status: failed to bind port %d (%s). Is the "
-                               "port in use? Set RENDERDOC_MCP_PORT to "
-                               "change it." % (_PORT, e))
-        return
-    _state["server"] = srv
-    _state["mutex"] = mutex
-    _set_running_ui(True, "Status: RUNNING at %s\n"
-                          "Serving the capture open in this RenderDoc "
-                          "window." % srv.url)
+    client = spoke_mod.SpokeClient(
+        _REG_HOST, _REG_PORT, _PORT, dispatch=_dispatch,
+        status_fn=rd_tools.current_status, meta=_instance_meta(),
+        log_cb=_ui_log, on_instance=_on_instance, on_hosted=_on_hosted,
+        on_stopped=_on_stopped)
+    _state["spoke"] = client
+    client.start()
+    _refresh_ui()
 
 
-def _stop_server(reason=""):
-    srv = _state["server"]
-    if srv is not None:
-        srv.stop()
-        _state["server"] = None
-        _ui_log("[MCP] server stopped" + (" (%s)" % reason if reason else ""))
-    _release_mutex()
-    if _state["mqt"] is not None and _state["status_label"] is not None:
-        _set_running_ui(False, "Status: STOPPED" +
-                        (" (%s)" % reason if reason else "") +
-                        ". Click 'Start Server' to restart at "
-                        "http://127.0.0.1:%d/mcp" % _PORT)
+def _stop_role():
+    client = _state["spoke"]
+    if client is not None:
+        _state["spoke"] = None
+        client.stop()
+        _ui_log("[mcp] stopped" +
+                (" (was instance %s)" % _state["instance_id"]
+                 if _state["instance_id"] else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -174,19 +199,20 @@ def _stop_server(reason=""):
 # ---------------------------------------------------------------------------
 
 def _toggle_clicked(ctx=None, widget=None, text=None):
-    if _state["server"] is not None:
-        _stop_server("user stop")
+    if _state["spoke"] is not None:
+        _stop_role()
     else:
-        _start_server()
+        _start_role()
 
 
 def _clear_clicked(ctx=None, widget=None, text=None):
     del _log_lines[:]
-    _ui_log("[MCP] log cleared")
+    _ui_log("[mcp] log cleared")
 
 
 def _window_closed(ctx=None, widget=None, text=None):
-    _stop_server("window closed")
+    # closing the status window must NOT stop the broker/role: other RenderDoc
+    # instances and agents may depend on it. Use the Stop button for that.
     _state["top"] = None
     _state["log_box"] = None
     _state["status_label"] = None
@@ -227,9 +253,10 @@ def _open_window(ctx, data):
 
     ctx.AddDockWindow(top, qrd.DockReference.NewFloatingArea, None)
 
-    _ui_log("[MCP] window opened, server starting on port %d "
-            "(endpoint /mcp)" % _PORT)
-    _start_server()
+    _ui_log("[mcp] MCP endpoint http://127.0.0.1:%d/mcp | instance "
+            "registration port %d" % (_PORT, _REG_PORT))
+    _refresh_ui()
+    _start_role()
 
 
 # ---------------------------------------------------------------------------
@@ -237,19 +264,19 @@ def _open_window(ctx, data):
 # ---------------------------------------------------------------------------
 
 def register(version, pyrenderdoc):
-    print("[renderdoc_mcp] registered in RenderDoc %s "
-          "(Tools -> RenderDoc MCP Server, port %d)"
-          % (version, _PORT))
+    print("[renderdoc_mcp] %s registered in RenderDoc %s "
+          "(endpoint http://127.0.0.1:%d/mcp)"
+          % (_VERSION, version, _PORT))
     pyrenderdoc.Extensions().RegisterWindowMenu(
         qrd.WindowMenu.Tools, ["RenderDoc MCP Server"], _open_window)
     rd_tools.set_context(pyrenderdoc)
     # auto-start so agents can use the server right after launch; the Tools
     # menu window can still be opened later for status (start is a no-op then)
-    _start_server()
+    _start_role()
 
 
 def unregister():
-    _stop_server("extension reloaded")
+    _stop_role()
     top = _state["top"]
     _state["top"] = None
     _state["log_box"] = None

@@ -1,21 +1,33 @@
 """Tool implementations for the RenderDoc MCP server.
 
-Every replay-dependent access goes through pyrenderdoc.Replay().BlockInvoke()
-which marshals the work onto the replay thread and is safe to call from the
-HTTP server's worker threads (the GIL is released while waiting).
+Every tool here runs *inside one RenderDoc instance*; the broker routes
+calls to it (see broker.py / spoke.py). All replay-dependent access goes
+through pyrenderdoc.Replay().BlockInvoke() which marshals the work onto the
+replay thread and is safe to call from broker/socket worker threads (the
+GIL is released while waiting).
+
+TOOL_IMPL at the bottom maps tool name -> implementation, matching the
+descriptions/schemas in tool_defs.py (shared with the standalone broker).
 """
 import base64
 import json
 import os
+import sys
 
 import renderdoc as rd
 
-_ctx = None  # qrenderdoc.CaptureContext, injected by __init__
+_ctx = None          # qrenderdoc.CaptureContext, injected by set_context()
+_instance_id = None  # broker-assigned id ("rd1", ...), via set_instance_id()
 
 
 def set_context(ctx):
     global _ctx
     _ctx = ctx
+
+
+def set_instance_id(iid):
+    global _instance_id
+    _instance_id = iid
 
 
 class ToolError(Exception):
@@ -188,6 +200,8 @@ def _texture_info_map(ctrl):  # noqa: kept for reference
 def get_capture_info(args):
     _require_capture()
     out = {}
+    if _instance_id:
+        out["instance"] = _instance_id
     try:
         out["capture_filename"] = str(_ctx.GetCaptureFilename())
     except Exception:
@@ -239,6 +253,8 @@ def list_drawcalls(args):
 
     _replay_invoke(work)
     payload = {"count": len(results), "drawcalls": results}
+    if _instance_id:
+        payload["instance"] = _instance_id
     if truncated[0]:
         payload["note"] = ("Output truncated at max_results=%d. Use marker "
                            "regions or filter in code." % max_results)
@@ -249,6 +265,8 @@ def get_drawcall_params(args):
     _require_capture()
     eid = int(args["event_id"])
     out = {"event_id": eid}
+    if _instance_id:
+        out["instance"] = _instance_id
 
     def work(ctrl):
         ctrl.SetFrameEvent(eid, True)
@@ -357,6 +375,8 @@ def get_shader_disassembly(args):
     eid = int(args["event_id"])
     stage = _parse_stage(args.get("stage"))
     disasm = {}
+    if _instance_id:
+        disasm["instance"] = _instance_id
 
     def work(ctrl):
         ctrl.SetFrameEvent(eid, True)
@@ -395,9 +415,11 @@ def get_screenshot(args):
     tex_id = args.get("texture_id")
     output_index = int(args.get("output_index", 0))
     chosen = {"source": None}
+    if _instance_id:
+        chosen["instance"] = _instance_id
 
     path = os.path.join(os.environ.get("TEMP", os.getcwd()),
-                        "renderdoc_mcp_shot.png")
+                        "renderdoc_mcp_shot_%d.png" % os.getpid())
 
     def work(ctrl):
         names = _names(ctrl)
@@ -513,6 +535,8 @@ def get_pixel_history(args):
     slice_ = int(args.get("slice", 0))
     eid = args.get("event_id")
     hist = {"texture": str(rid), "x": x, "y": y, "mip": mip, "slice": slice_}
+    if _instance_id:
+        hist["instance"] = _instance_id
     mods = []
 
     def work(ctrl):
@@ -660,22 +684,11 @@ def get_debug_messages(args):
 
 
 def get_current_state(args):
-    out = {}
-    if _ctx is not None:
-        try:
-            out["capture_loaded"] = bool(_ctx.IsCaptureLoaded())
-        except Exception:
-            out["capture_loaded"] = False
-        try:
-            out["current_event"] = int(_ctx.CurEvent())
-        except Exception:
-            pass
-        try:
-            out["capture_filename"] = str(_ctx.GetCaptureFilename())
-        except Exception:
-            pass
+    out = current_status()
     if not out.get("capture_loaded"):
-        raise ToolError("No capture is loaded in this RenderDoc instance.")
+        out["note"] = ("No capture is loaded. Use launch_app + "
+                       "trigger_capture + list_captures + open_capture, or "
+                       "open a capture in the UI.")
     return _text_result(out)
 
 
@@ -701,24 +714,46 @@ def _clear_conn(*a):
 
 
 def launch_app(args):
-    """Exactly equivalent to clicking 'Launch' in the Launch Application
-    window: launches whatever the dialog currently shows. If the dialog is
-    still empty, first load qrenderdoc's last-used settings (most_recent.cap)
-    — the same as clicking the top entry in the dialog's recent settings
-    list. No fields are modified beyond that."""
+    """Launch a program under capture control. With exe/working_dir/cmdline
+    the values are typed into the Launch Application dialog (Settings copy +
+    SetSettings, exactly what the UI does on edit); without them the
+    dialog's current settings are used, loading most_recent.cap if empty -
+    equivalent to clicking Launch in both cases."""
     global _conn
     if _ctx is None:
         raise ToolError("Extension not initialized yet.")
+    exe = args.get("exe")
+    working_dir = args.get("working_dir")
+    cmdline = args.get("cmdline")
     settings_file = args.get("settings_file")
+
+    if exe and not os.path.isfile(exe):
+        # pre-check here: the dialog would show a *modal* error box instead
+        raise ToolError("Executable not found: %s" % exe)
+    if working_dir and not os.path.isdir(working_dir):
+        raise ToolError("Working directory not found: %s" % working_dir)
+
     dialog = _ctx.GetCaptureDialog()
-    s = dialog.Settings()
-    if settings_file or not str(s.executable):
-        settings_file = settings_file or _settings_file()
-        if not os.path.isfile(settings_file):
-            raise ToolError("Settings file not found: %s" % settings_file)
-        dialog.LoadSettings(settings_file)
+    if exe or working_dir is not None or cmdline is not None:
+        s = dialog.Settings()  # a copy of the dialog's current settings
+        if exe:
+            s.executable = exe
+        if working_dir is not None:
+            s.workingDir = working_dir
+        if cmdline is not None:
+            s.commandLine = cmdline
+        dialog.SetSettings(s)  # pushes back + updates the dialog UI fields
         s = dialog.Settings()
-    info = {"settings_file": settings_file,
+    else:
+        s = dialog.Settings()
+        if settings_file or not str(s.executable):
+            settings_file = settings_file or _settings_file()
+            if not os.path.isfile(settings_file):
+                raise ToolError("Settings file not found: %s" % settings_file)
+            dialog.LoadSettings(settings_file)
+            s = dialog.Settings()
+    info = {"instance": _instance_id,
+            "settings_file": settings_file,
             "exe": str(s.executable),
             "working_dir": str(s.workingDir),
             "cmdline": str(s.commandLine)}
@@ -747,8 +782,8 @@ def trigger_capture(args):
     delay = float(args.get("delay_seconds", 0) or 0)
     num = int(args.get("num_frames", 1) or 1)
     _conn.TimedCapture(delay, num)
-    return _text_result({"queued": True, "delay_seconds": delay,
-                         "num_frames": num,
+    return _text_result({"instance": _instance_id, "queued": True,
+                         "delay_seconds": delay, "num_frames": num,
                          "note": "poll list_captures until the capture appears"})
 
 
@@ -756,7 +791,8 @@ def list_captures(args):
     """List captures made on the active capture connection."""
     if _conn is None:
         raise ToolError("No active capture connection. Call launch_app first.")
-    out = {"connected": bool(_conn.IsConnected())}
+    out = {"instance": _instance_id,
+           "connected": bool(_conn.IsConnected())}
     try:
         out["apis"] = [str(a) for a in _conn.GetAPIs()]
     except Exception:
@@ -777,169 +813,31 @@ def open_capture(args):
         raise ToolError("No active capture connection. Call launch_app first.")
     cid = int(args["capture_id"])
     _conn.OpenCapture(cid)
-    return _text_result({"opened": cid,
+    return _text_result({"instance": _instance_id, "opened": cid,
                          "note": "capture is loading into the UI; poll "
                                  "get_current_state until capture_loaded"})
 
 
 # ---------------------------------------------------------------------------
-# registry (name -> definition) — consumed by mcp_server
+# registry: tool name -> implementation (descriptions/schemas live in
+# tool_defs.py; the broker routes 'instance'-scoped tools here via spoke.py)
 # ---------------------------------------------------------------------------
 
-def _def(description, schema, call):
-    return {"description": description, "schema": schema, "call": call}
-
-
-TOOLS = {
-    "get_capture_info": _def(
-        "Get general info about the capture currently open in this RenderDoc "
-        "UI instance: file path, graphics API, frame number, resource counts "
-        "and any API debug/validation messages.",
-        {"type": "object", "properties": {}},
-        get_capture_info),
-
-    "get_current_state": _def(
-        "Get the current UI state: whether a capture is loaded and which "
-        "event is currently selected.",
-        {"type": "object", "properties": {}},
-        get_current_state),
-
-    "list_drawcalls": _def(
-        "List the drawcall/dispatch/copy action tree of the open capture as a "
-        "flat list. Use an entry's event_id with get_drawcall_params for full "
-        "details.",
-        {"type": "object", "properties": {
-            "include_markers": {"type": "boolean",
-                                "description": "Include marker/debug regions.",
-                                "default": False},
-            "max_results": {"type": "integer", "default": 2000}}},
-        list_drawcalls),
-
-    "get_drawcall_params": _def(
-        "Get the full pipeline state at a given drawcall/dispatch: output "
-        "targets, depth target, pipeline objects, bound shaders with "
-        "reflection (inputs/outputs/constant blocks), all used descriptor "
-        "bindings, viewport and API debug messages. Note: this moves the "
-        "RenderDoc UI to that event.",
-        {"type": "object", "properties": {
-            "event_id": {"type": "integer",
-                         "description": "EID from list_drawcalls"}},
-         "required": ["event_id"]},
-        get_drawcall_params),
-
-    "get_screenshot": _def(
-        "Save a texture to PNG and return it as an image so the agent can "
-        "visually inspect the render output. Defaults to the first color "
-        "output target at event_id (or the currently selected event if "
-        "omitted); pass texture_id to screenshot any texture.",
-        {"type": "object", "properties": {
-            "event_id": {"type": "integer"},
-            "texture_id": {"type": "string",
-                           "description": "ResourceId like '123' or "
-                                          "'ResourceId(123)' from "
-                                          "get_texture_list"},
-            "output_index": {"type": "integer", "default": 0}}},
-        get_screenshot),
-
-    "get_pixel_history": _def(
-        "Get the full modification history of one pixel of a texture across "
-        "the frame: which events wrote it, with which color/depth values and "
-        "shader outputs. Essential for diagnosing 'why is this pixel wrong'.",
-        {"type": "object", "properties": {
-            "texture_id": {"type": "string"},
-            "x": {"type": "integer"}, "y": {"type": "integer"},
-            "mip": {"type": "integer", "default": 0},
-            "slice": {"type": "integer", "default": 0},
-            "event_id": {"type": "integer"}},
-         "required": ["texture_id", "x", "y"]},
-        get_pixel_history),
-
-    "get_shader_disassembly": _def(
-        "Get the disassembly of the shader bound at a stage for an event.",
-        {"type": "object", "properties": {
-            "event_id": {"type": "integer"},
-            "stage": {"type": "string", "default": "pixel",
-                      "description": "vertex/hull/domain/geometry/pixel/"
-                                     "compute"},
-            "target": {"type": "string",
-                       "description": "Optional disassembly target; see "
-                                      "returned 'targets' list"}},
-         "required": ["event_id"]},
-        get_shader_disassembly),
-
-    "get_texture_list": _def(
-        "List textures/resources in the capture with id, name, dimensions "
-        "and format.",
-        {"type": "object", "properties": {
-            "max_results": {"type": "integer", "default": 500},
-            "name_filter": {"type": "string"}}},
-        get_texture_list),
-
-    "get_buffer_list": _def(
-        "List buffers in the capture with id, name and length.",
-        {"type": "object", "properties": {
-            "max_results": {"type": "integer", "default": 500},
-            "name_filter": {"type": "string"}}},
-        get_buffer_list),
-
-    "get_buffer_data": _def(
-        "Read raw bytes of a buffer as a hexdump (plus base64 if <= 4096 "
-        "bytes).",
-        {"type": "object", "properties": {
-            "buffer_id": {"type": "string"},
-            "offset": {"type": "integer", "default": 0},
-            "length": {"type": "integer", "default": 1024}},
-         "required": ["buffer_id"]},
-        get_buffer_data),
-
-    "get_event_usage": _def(
-        "Get every event where a given resource is used (read/written), for "
-        "tracing resource lifetime through the frame.",
-        {"type": "object", "properties": {
-            "resource_id": {"type": "string"}},
-         "required": ["resource_id"]},
-        get_event_usage),
-
-    "get_debug_messages": _def(
-        "Get all API debug/validation messages emitted by the capture's "
-        "debug layer.",
-        {"type": "object", "properties": {}},
-        get_debug_messages),
-
-    "launch_app": _def(
-        "Exactly equivalent to clicking 'Launch' in the Launch Application "
-        "window: launches the executable the dialog currently shows, with "
-        "its working directory and command line. If the dialog is empty, "
-        "qrenderdoc's last-used settings (most_recent.cap) are loaded first "
-        "— same as clicking the top entry of the recent settings list. Use "
-        "trigger_capture afterwards to capture frames.",
-        {"type": "object", "properties": {
-            "settings_file": {"type": "string",
-                              "description": "Optional .cap settings file to "
-                                             "load before launching"}}},
-        launch_app),
-
-    "trigger_capture": _def(
-        "Ask the program launched by launch_app to capture a frame after "
-        "delay_seconds (0 = immediately).",
-        {"type": "object", "properties": {
-            "delay_seconds": {"type": "number", "default": 0},
-            "num_frames": {"type": "integer", "default": 1,
-                           "description": "How many frames to capture "
-                                          "starting at the delayed one."}}},
-        trigger_capture),
-
-    "list_captures": _def(
-        "List the captures made so far on the connection launched by "
-        "launch_app, with their capture_id for open_capture.",
-        {"type": "object", "properties": {}},
-        list_captures),
-
-    "open_capture": _def(
-        "Open a captured frame (by capture_id from list_captures) into the "
-        "RenderDoc UI so the analysis tools can inspect it.",
-        {"type": "object", "properties": {
-            "capture_id": {"type": "integer"}},
-         "required": ["capture_id"]},
-        open_capture),
+TOOL_IMPL = {
+    "get_capture_info": get_capture_info,
+    "get_current_state": get_current_state,
+    "list_drawcalls": list_drawcalls,
+    "get_drawcall_params": get_drawcall_params,
+    "get_screenshot": get_screenshot,
+    "get_pixel_history": get_pixel_history,
+    "get_shader_disassembly": get_shader_disassembly,
+    "get_texture_list": get_texture_list,
+    "get_buffer_list": get_buffer_list,
+    "get_buffer_data": get_buffer_data,
+    "get_event_usage": get_event_usage,
+    "get_debug_messages": get_debug_messages,
+    "launch_app": launch_app,
+    "trigger_capture": trigger_capture,
+    "list_captures": list_captures,
+    "open_capture": open_capture,
 }
