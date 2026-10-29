@@ -78,6 +78,8 @@ class LocalSpoke(object):
         self.remote = False
         self._dispatch = dispatch
         self._status_fn = status_fn
+        self.started_at = time.time()
+        self.last_used = None
 
     def call(self, tool, args, timeout=0):
         content, is_err = self._dispatch(tool, args)
@@ -105,6 +107,8 @@ class RemoteSpoke(object):
         self._lock = threading.Lock()
         self._reqid = 0
         self._dead = False
+        self.started_at = time.time()
+        self.last_used = None
 
     def _request(self, payload, timeout):
         if self._dead:
@@ -182,7 +186,7 @@ class RemoteSpoke(object):
 
 class Broker(object):
     def __init__(self, http_port=30007, reg_port=30008, log_cb=None,
-                 name="renderdoc-mcp", version="0.2.0", rd_exe=None,
+                 name="renderdoc-mcp", version="0.3.0", rd_exe=None,
                  rd_exe_source=None):
         self._http_port = http_port
         self._reg_port = reg_port
@@ -242,6 +246,8 @@ class Broker(object):
                 entry["call"] = self._tool_list_instances
             elif name == "start_renderdoc":
                 entry["call"] = self._tool_start_renderdoc
+            elif name == "shutdown_instance":
+                entry["call"] = self._tool_shutdown_instance
             else:
                 entry["call"] = (lambda n:
                                  lambda args: self._route(n, args))(name)
@@ -399,6 +405,7 @@ class Broker(object):
         args = dict(args or {})
         inst = args.pop("instance", None)
         spoke = self._resolve(inst)
+        spoke.last_used = time.time()
         reply = spoke.call(name, args, self._call_timeout)
         content = reply.get("content")
         if not content:
@@ -448,6 +455,12 @@ class Broker(object):
                                % self._status_timeout}
             out = {"instance": s.id, "remote": s.remote}
             out.update(s.describe())
+            out["started_at"] = _iso_time(s.started_at)
+            out["last_used"] = _iso_time(s.last_used) \
+                if s.last_used is not None else None
+            # has_capture_connection: whether a launched program is still
+            # connected to that instance (from the spoke status if reported)
+            out["has_capture_connection"] = st.get("app_connected")
             out.update(st)
             instances.append(out)
         out = {"endpoint": self.url,
@@ -456,6 +469,77 @@ class Broker(object):
                "rd_exe_source": self._rd_exe_source,
                "instances": instances}
         return tool_defs.text_result(out)
+
+    def _tool_shutdown_instance(self, args):
+        args = dict(args or {})
+        inst = args.get("instance")
+        spoke = self._resolve(inst)
+        try:
+            pid = int(spoke.meta.get("pid", 0))
+        except (TypeError, ValueError):
+            pid = 0
+        self._log("[broker] shutdown_instance %s (pid %s)" % (spoke.id, pid))
+        graceful_note = ""
+        try:
+            reply = spoke.call("shutdown_instance", {},
+                               min(self._call_timeout, 15.0))
+            if reply.get("isError"):
+                content = reply.get("content") or []
+                if content and isinstance(content[0], dict):
+                    graceful_note = str(content[0].get("text", ""))[:200]
+        except Exception as e:
+            graceful_note = str(e)
+        if spoke.remote:
+            # a different process: wait for it to exit, kill if needed
+            method = "graceful"
+            if not _wait_exit(pid, 5.0):
+                method = "kill"
+                try:
+                    winprocess.terminate(pid)
+                except Exception as e:
+                    graceful_note += " terminate failed: %s" % e
+                if not _wait_exit(pid, 3.0):
+                    method = "kill (unverified)"
+                    graceful_note += (" process did not confirm exit; "
+                                      "removed from instance table anyway")
+            self._drop_spoke(spoke)
+        else:
+            # our own process: respond first, then finish shutting down in
+            # the background so the HTTP reply gets out
+            method = "graceful"
+            graceful_note += (" this broker is hosted by the instance being "
+                              "shut down; the process exits after this "
+                              "response (force-killed if graceful close "
+                              "stalls)")
+            t = threading.Thread(target=self._finish_own_shutdown,
+                                 args=(pid,), daemon=True)
+            t.start()
+            self._drop_spoke(spoke)
+        out = {"shutdown": True, "method": method, "pid": pid,
+               "instance": spoke.id}
+        if graceful_note:
+            out["note"] = graceful_note.strip()
+        return tool_defs.text_result(out)
+
+    def _drop_spoke(self, spoke):
+        with self._lock:
+            if self._spokes.get(spoke.id) is spoke:
+                del self._spokes[spoke.id]
+        if spoke.remote:
+            try:
+                spoke._kill("shutdown")
+            except Exception:
+                pass
+        self._log("[broker] instance %s removed from instance table"
+                  % spoke.id)
+
+    def _finish_own_shutdown(self, pid):
+        time.sleep(1.0)
+        if not _wait_exit(pid, 5.0):
+            try:
+                winprocess.terminate(pid)
+            except Exception:
+                pass
 
     def _tool_start_renderdoc(self, args):
         if not self._rd_exe:
@@ -492,6 +576,32 @@ class Broker(object):
                                "it may still be starting - check "
                                "list_instances" % wait_seconds)
         return tool_defs.text_result(out)
+
+
+def _iso_time(ts):
+    """Unix timestamp -> local ISO 'YYYY-MM-DDTHH:MM:SS' (None-safe)."""
+    if ts is None:
+        return None
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts))
+    except Exception:
+        return None
+
+
+def _wait_exit(pid, timeout):
+    """True when the process is gone (or pid unknown) within timeout."""
+    if not pid:
+        return True
+    deadline = time.time() + timeout
+    while True:
+        try:
+            if not winprocess.alive(pid):
+                return True
+        except Exception:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def _env_float(var, default):

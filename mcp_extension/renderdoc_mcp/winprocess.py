@@ -71,6 +71,53 @@ def _spawn_ctypes(cmdline, workdir, extra_env=None):
     return pid
 
 
+def _k32():
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int,
+                                ctypes.c_uint32]
+    k32.TerminateProcess.restype = ctypes.c_int
+    k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    return k32
+
+
+def alive(pid):
+    """True when the process exists. Raises OSError when process checks are
+    unavailable (non-windows builds)."""
+    if os.name != "nt":
+        raise OSError("alive() only supported on Windows")
+    if not pid:
+        return False
+    k32 = _k32()
+    # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = k32.OpenProcess(0x1000, False, int(pid))
+    if not h:
+        return False
+    k32.CloseHandle(h)
+    return True
+
+
+def terminate(pid):
+    """Force-terminate a process by pid. Raises OSError on failure."""
+    if os.name != "nt":
+        raise OSError("terminate() only supported on Windows")
+    if not pid:
+        raise OSError("terminate: no pid")
+    k32 = _k32()
+    # PROCESS_TERMINATE = 0x0001
+    h = k32.OpenProcess(0x0001, False, int(pid))
+    if not h:
+        raise OSError("OpenProcess(%d) failed: error %d"
+                      % (pid, ctypes.get_last_error()))
+    try:
+        if not k32.TerminateProcess(h, 1):
+            raise OSError("TerminateProcess(%d) failed: error %d"
+                          % (pid, ctypes.get_last_error()))
+    finally:
+        k32.CloseHandle(h)
+
+
 def spawn(exe, args="", workdir=None, extra_env=None):
     """Launch ``exe`` (quoted command line built from args) detached; returns
     the new process id. extra_env overrides environment variables for the

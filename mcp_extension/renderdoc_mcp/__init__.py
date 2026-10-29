@@ -31,7 +31,7 @@ except ImportError:
     import rd_tools
     import spoke as spoke_mod
 
-_VERSION = "0.2.0"
+_VERSION = "0.3.0"
 _PORT = int(os.environ.get("RENDERDOC_MCP_PORT", "30007"))
 _REG_PORT = int(os.environ.get("RENDERDOC_MCP_REG_PORT", str(_PORT + 1)))
 _REG_HOST = "127.0.0.1"
