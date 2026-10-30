@@ -51,6 +51,7 @@ class SpokeClient(object):
         self._sock = None
         self._broker = None
         self._instance_id = None
+        self._last_hostfail_log = 0.0
 
     # -- public ------------------------------------------------------------
 
@@ -105,6 +106,14 @@ class SpokeClient(object):
                     first = False
                 if self._try_host():
                     return  # hosting: done until stop()
+                # keep retrying so a broker that appears later (restart,
+                # slow startup) picks this instance up automatically
+                now = time.time()
+                if now - self._last_hostfail_log >= 30.0:
+                    self._last_hostfail_log = now
+                    self._log("[spoke] registration retry continues every "
+                              "2s (broker will pick this instance up "
+                              "automatically once it is up)")
                 time.sleep(2.0)
                 continue
             first = False
@@ -128,7 +137,9 @@ class SpokeClient(object):
             host_meta=self._meta, host_dispatch=self._dispatch,
             host_status=self._status_fn)
         if b is None:
-            if reason:
+            now = time.time()
+            if reason and now - self._last_hostfail_log >= 30.0:
+                self._last_hostfail_log = now
                 self._log("[spoke] cannot host broker: %s" % reason)
             return False
         self._broker = b

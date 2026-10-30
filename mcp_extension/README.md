@@ -3,23 +3,62 @@
 一个 qrenderdoc UI 扩展：在 **Tools → RenderDoc MCP Server** 菜单中启动一个可见的服务窗口，
 通过 MCP（Model Context Protocol，Streamable HTTP）向 AI Agent 暴露当前打开抓帧的分析能力。
 
+当前版本 **v0.4.0**（broker 一机一实例 + 多 RenderDoc 实例注册路由）。
+
+## 自测
+
+```powershell
+# 端到端自测（起独立 broker + 4 个假实例，54 项断言；勿占用正在使用的 30007）
+python mcp_extension\test_client.py --selftest --port 31177
+```
+
 ## 功能
 
-服务窗口启动后，AI Agent 可以调用 12 个工具分析**当前在 RenderDoc UI 中打开的抓帧**：
+服务窗口启动后，AI Agent 可以调用 20+ 个工具分析**当前在 RenderDoc UI 中打开的抓帧**：
 
 | 工具 | 作用 |
 |------|------|
 | `get_capture_info` | 抓帧概览：文件路径、图形 API、帧号、资源数量、调试消息 |
 | `get_current_state` | 当前 UI 状态：是否加载抓帧、当前选中的事件 |
-| `list_drawcalls` | 列出 drawcall / dispatch / copy 动作树（扁平列表） |
+| `list_drawcalls` | 列出 drawcall / dispatch / copy 动作树（扁平列表，带过滤） |
 | `get_drawcall_params` | 指定 EID 的完整管线状态：输出目标、绑定 Shader 及反射、描述符、视口等 |
-| `get_screenshot` | 将纹理存为 PNG 并返回图片，供 Agent 视觉检查渲染结果 |
+| `get_screenshot` | 纹理存 PNG 返回图片；`region` 裁剪 / `max_width` 缩放 / `save_to` 落盘防超限 |
 | `get_pixel_history` | 单像素完整修改历史（诊断"这个像素为什么不对"） |
 | `get_shader_disassembly` | 指定阶段 Shader 的反汇编 |
 | `get_texture_list` / `get_buffer_list` | 资源列表（id、名字、尺寸、格式） |
 | `get_buffer_data` | 读取 Buffer 原始字节（hexdump） |
-| `get_event_usage` | 资源在整帧中的所有使用点 |
+| `get_buffer_regions` | Buffer 按值分类区域画像（0x00 / 0xCD 调试堆填充 / uniform / mixed） |
+| `buffer_search` | Buffer 内模式搜索（u32 / f32 / hex，支持 stride 对齐） |
+| `get_vertex_data` | stride 感知顶点解码（attrs 布局 → 每顶点命名值） |
+| `get_event_usage` | 资源在整帧中的所有使用点（注：宿主持久映射 memcpy 写入不可见） |
 | `get_debug_messages` | 图形 API 调试层消息 |
+| `get_texture_stats` / `compare_regions` | 区域数值统计 / 双纹理区域对比 |
+| `get_constant_buffer` | cbuffer 反射布局 + 内容导出 |
+
+Broker 级工具（无需实例连接）：`list_instances`、`start_renderdoc`、
+`shutdown_instance`、`list_capture_files`。
+
+抓帧控制：`launch_app` → `trigger_capture` / `capture_and_open` →
+`list_captures` / `open_capture` / `close_capture`。
+
+### 手动抓帧分析（REQ-01/02/03）
+
+被测程序由**人工手动启动并手动抓帧**（不经 `launch_app`）时，抓帧完全不可达于
+连接层，但 .rdc 文件落在 `%TEMP%\RenderDoc\`，按
+`<程序名>_<启动时间戳>_frame<帧号>.rdc` 命名。分析路径：
+
+1. `list_capture_files` — 无需任何实例连接，枚举磁盘上的 .rdc
+   （默认扫 `%TEMP%\RenderDoc`，支持 `dir` / `name_filter` / `max_results`）；
+2. `open_capture_file(path, instance?)` — 在**已连接的实例内**加载/换帧
+   （异步加载，`wait_seconds>0` 时等完为止），同一实例可连续换
+   frame23414 → frame23423，避免一帧一个新进程；
+3. 没有可用实例时 `start_renderdoc(args="<path.rdc>")` 拉起一个（用
+   `SW_SHOWNOACTIVATE`，不抢焦点）。
+
+`list_captures` / `open_capture` / `trigger_capture` 等在无连接时的报错都会
+直接给出上述出路。注意：手动启动的 RenderDoc 只要装了本扩展就会**每 2 秒重试
+注册**，broker 起来后自动出现在 `list_instances`（含 `last_seen` /
+`state: active|stale`）。
 
 约束说明：
 
@@ -111,16 +150,22 @@ async def main():
 
 ## 多 RenderDoc 实例
 
-默认端口 `30007`，全系统仅一个实例能占用。若想让 Agent 同时连接多个 RenderDoc
-（例如对比两份抓帧），给不同实例配不同端口后分别连接：
+全机只有一个 broker（互斥锁保证），**每个**运行本扩展的 qrenderdoc 实例都自动
+注册进来，共享同一个 MCP 端点：
+
+- `list_instances` 列出全部实例（id、pid、可执行文件、抓帧状态、`last_seen`、
+  `state: active|stale`）；所有实例级工具都接受 `instance` 参数选择目标，
+  只连一个实例时可省略。
+- broker 不在时，第一个实例自举为 broker；broker 所在实例退出后其它实例自动接管。
+- 实例在 broker 未启动期间会每 2 秒重试注册，broker 起来后自动出现。
+
+也可以在启动 qrenderdoc 前先起独立 broker（推荐，Agent 无需依赖任何实例存活）：
 
 ```powershell
-# 启动第二个 qrenderdoc 前设置端口
-$env:RENDERDOC_MCP_PORT = "30008"
-& D:\MyCodes\renderdoc\x64\Development\qrenderdoc.exe
+python D:\MyCodes\renderdoc\mcp_extension\rdmcp_broker.py --exe D:\MyCodes\renderdoc\x64\Development\qrenderdoc.exe
 ```
 
-Agent 侧再配一个 `renderdoc2` 指向 `http://127.0.0.1:30008/mcp`。
+停止：`python rdmcp_broker.py --quit`。
 
 ## 故障排查
 
@@ -131,7 +176,14 @@ Agent 侧再配一个 `renderdoc2` 指向 `http://127.0.0.1:30008/mcp`。
   或残留进程未退出。用 `netstat -ano | findstr 30007` 排查。
 - **Agent 连不上**：确认服务窗口状态为 RUNNING；`curl http://127.0.0.1:30007/mcp`
   应返回 405（正常，只接受 POST）。
-- **工具调用报 "No capture is loaded"**：先在 RenderDoc UI 中打开一个抓帧。
+- **工具调用报 "No capture is loaded"**：先在 RenderDoc UI 中打开一个抓帧，或
+  用 `open_capture_file(path)` 从磁盘加载（`list_capture_files` 可枚举候选）。
+- **手动抓的帧在 Agent 眼里"不存在"**：不经 `launch_app` 的抓帧不进连接列表，
+  .rdc 落在 `%TEMP%\RenderDoc\` —— `list_capture_files` →
+  `open_capture_file(path)`（详见"手动抓帧分析"一节）。
+- **实例不在 `list_instances` 里**：确认该实例装了本扩展且已启用；实例每 2 秒
+  重试注册，broker 起来后会自动出现（无需重启实例）。`state: stale` 表示
+  `last_seen` 超过 120 秒没有信号（实例可能假死或被挂起）。
 
 ## 已知限制（内嵌 Python 3.6）
 
@@ -144,11 +196,19 @@ Python 3.6 官方的 `_socket.pyd` + `select.pyd` 可恢复标准 socket 支持�
 
 ```
 mcp_extension/
-├── install.ps1                  # 一键安装脚本
-├── README.md                    # 本文件
+├── install.ps1                       # 一键安装脚本
+├── README.md                         # 本文件
+├── rdmcp_broker.py                   # 独立 broker（先于 qrenderdoc 启动）
+├── test_client.py                    # 手动客户端 + 端到端自测
+├── MCP_IMPROVEMENT_REQUIREMENTS*.md  # 需求文档（V2 已全部实现）
 └── renderdoc_mcp/
-    ├── extension.json           # 扩展清单
-    ├── __init__.py              # 菜单入口 + 服务窗口 + 互斥锁
-    ├── mcp_server.py            # MCP 协议 + Winsock HTTP 服务器
-    └── rd_tools.py              # 12 个抓帧分析工具（经 BlockInvoke 执行）
+    ├── extension.json                # 扩展清单
+    ├── __init__.py                   # 菜单入口 + 服务窗口 + spoke 启动
+    ├── mcp_server.py                 # MCP 协议 + Winsock HTTP 服务器
+    ├── broker.py                     # broker：路由/注册/last_seen/文件枚举
+    ├── spoke.py                      # 实例侧注册客户端（断线重试保活）
+    ├── tool_defs.py                  # 工具定义（broker 与实例共享）
+    ├── wire.py                       # broker<->实例 帧协议（ctypes winsock）
+    ├── winprocess.py                 # 进程拉起（SW_SHOWNOACTIVATE 支持）
+    └── rd_tools.py                   # 全部实例侧工具实现（replay 线程）
 ```

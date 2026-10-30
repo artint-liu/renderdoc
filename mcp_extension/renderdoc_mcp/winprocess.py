@@ -9,6 +9,8 @@ import ctypes
 import os
 
 CREATE_NO_WINDOW = 0x08000000
+STARTF_USESHOWWINDOW = 0x00000001
+SW_SHOWNOACTIVATE = 4
 
 
 def _env_block(extra_env):
@@ -21,7 +23,7 @@ def _env_block(extra_env):
     return ("\0".join(items) + "\0\0").encode("utf-16-le")
 
 
-def _spawn_ctypes(cmdline, workdir, extra_env=None):
+def _spawn_ctypes(cmdline, workdir, extra_env=None, no_activate=False):
     from ctypes import wintypes
 
     class STARTUPINFO(ctypes.Structure):
@@ -51,6 +53,12 @@ def _spawn_ctypes(cmdline, workdir, extra_env=None):
 
     si = STARTUPINFO()
     si.cb = ctypes.sizeof(si)
+    if no_activate:
+        # GUI apps that call ShowWindow(SW_SHOWDEFAULT) (Qt does) take the
+        # show state from STARTUPINFO - SW_SHOWNOACTIVATE avoids stealing
+        # the user's focus
+        si.dwFlags |= STARTF_USESHOWWINDOW
+        si.wShowWindow = SW_SHOWNOACTIVATE
     pi = PROCESS_INFORMATION()
     # first parameter is the app name, second the full command line; passing
     # the app name explicitly avoids path quirks with spaces
@@ -118,10 +126,11 @@ def terminate(pid):
         k32.CloseHandle(h)
 
 
-def spawn(exe, args="", workdir=None, extra_env=None):
+def spawn(exe, args="", workdir=None, extra_env=None, no_activate=False):
     """Launch ``exe`` (quoted command line built from args) detached; returns
     the new process id. extra_env overrides environment variables for the
-    child. Raises OSError on failure."""
+    child. no_activate shows GUI windows with SW_SHOWNOACTIVATE (never
+    steals the user's focus). Raises OSError on failure."""
     exe = os.path.abspath(exe)
     if not os.path.isfile(exe):
         raise OSError("executable not found: %s" % exe)
@@ -135,8 +144,15 @@ def spawn(exe, args="", workdir=None, extra_env=None):
         if extra_env:
             env = dict(os.environ)
             env.update(extra_env)
-        proc = subprocess.Popen(cmdline, cwd=workdir, env=env,
-                                creationflags=CREATE_NO_WINDOW)
+        popen_kwargs = {"cwd": workdir, "env": env,
+                        "creationflags": CREATE_NO_WINDOW}
+        if no_activate:
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = SW_SHOWNOACTIVATE
+            popen_kwargs["startupinfo"] = si
+        proc = subprocess.Popen(cmdline, **popen_kwargs)
         return proc.pid
     except ImportError:
-        return _spawn_ctypes(cmdline, workdir, extra_env)
+        return _spawn_ctypes(cmdline, workdir, extra_env,
+                             no_activate=no_activate)

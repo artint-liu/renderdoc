@@ -1,9 +1,9 @@
 {
     "extension_api": 1,
     "name": "RenderDoc MCP Server",
-    "version": "0.1.0",
+    "version": "0.4.0",
     "minimum_renderdoc": "1.6",
-    "description": "Exposes an MCP (Model Context Protocol) server over local HTTP, allowing AI Agents to inspect the capture currently open in this RenderDoc instance: drawcall list, pipeline state, screenshots, pixel history, shader disassembly, buffers and debug messages.",
+    "description": "Exposes an MCP (Model Context Protocol) broker over local HTTP. Every instance running this extension registers with the broker; AI Agents can list instances, launch programs under capture control, load .rdc captures from disk (including manually captured ones) and inspect them: drawcall list, pipeline state, screenshots (region/scale/save-to), pixel history, shader disassembly, buffer regions/search/vertex decode and debug messages.",
     "author": "",
     "url": ""
 }

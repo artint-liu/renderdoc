@@ -24,10 +24,11 @@ _INSTANCE_TOOLS = [
     "get_capture_info", "get_current_state", "list_drawcalls",
     "get_drawcall_params", "get_screenshot", "get_pixel_history",
     "get_shader_disassembly", "get_texture_list", "get_buffer_list",
-    "get_buffer_data", "get_event_usage", "get_debug_messages",
+    "get_buffer_data", "get_buffer_regions", "buffer_search",
+    "get_vertex_data", "get_event_usage", "get_debug_messages",
     "launch_app", "trigger_capture", "list_captures", "open_capture",
-    "close_capture", "capture_and_open", "get_texture_stats",
-    "compare_regions", "get_constant_buffer",
+    "open_capture_file", "close_capture", "capture_and_open",
+    "get_texture_stats", "compare_regions", "get_constant_buffer",
 ]
 
 
@@ -89,14 +90,32 @@ _BASE = {
         "Save a texture to PNG and return it as an image so the agent can "
         "visually inspect the render output. Defaults to the first color "
         "output target at event_id (or the currently selected event if "
-        "omitted); pass texture_id to screenshot any texture.",
+        "omitted); pass texture_id to screenshot any texture. Large "
+        "responses are avoided with region(x, y, w, h) to capture only a "
+        "sub-rectangle, max_width to downscale before encoding, and/or "
+        "save_to(path) to write the PNG to disk and return only the path "
+        "(agent reads the file itself). region/max_width need a directly "
+        "decodable format (UNORM8/16, SNORM8, F16/F32); plain save_to works "
+        "for every format.",
         {"type": "object", "properties": {
             "event_id": {"type": "integer"},
             "texture_id": {"type": "string",
                            "description": "ResourceId like '123' or "
                                           "'ResourceId(123)' from "
                                           "get_texture_list"},
-            "output_index": {"type": "integer", "default": 0}}}),
+            "output_index": {"type": "integer", "default": 0},
+            "region": {"type": "array", "items": {"type": "integer"},
+                       "minItems": 4, "maxItems": 4,
+                       "description": "Crop before encoding: [x, y, w, h] "
+                                      "in texture pixels"},
+            "max_width": {"type": "integer",
+                          "description": "Downscale the (cropped) image to "
+                                         "this width before PNG encoding"},
+            "save_to": {"type": "string",
+                        "description": "Write the PNG to this absolute path "
+                                       "and return the path instead of "
+                                       "inlining base64 (parent dirs are "
+                                       "created; .png appended if missing)"}}}),
 
     "get_pixel_history": _def(
         "Get the full modification history of one pixel of a texture across "
@@ -157,9 +176,81 @@ _BASE = {
             "length": {"type": "integer", "default": 1024}},
          "required": ["buffer_id"]}),
 
+    "get_buffer_regions": _def(
+        "Classify a buffer's bytes into merged same-class regions: '0x00' "
+        "runs, '0xCD' runs (MSVC debug-heap fill - the signature of a GPU "
+        "heap/instance that was never written by the program), uniform "
+        "'0xNN' runs and 'mixed'. Answers 'how much of this buffer was "
+        "actually written, and where' without shipping a hexdump to the "
+        "agent. Also reports bytes_by_class and first_written_offset.",
+        {"type": "object", "properties": {
+            "buffer_id": {"type": "string"},
+            "event_id": {"type": "integer",
+                         "description": "Event to replay before reading "
+                                        "(omit = currently selected)"},
+            "max_regions": {"type": "integer", "default": 64,
+                            "description": "Cap on returned regions; when "
+                                           "exceeded the tail is merged and "
+                                           "truncated=true is set"}},
+         "required": ["buffer_id"]}),
+
+    "buffer_search": _def(
+        "Search a buffer's bytes for a pattern and get absolute byte "
+        "offsets: type 'u32' (little-endian integer), 'f32' (exact IEEE "
+        "float bits, e.g. pattern=1076.0 for 0x44856000) or 'hex' (hex "
+        "string). stride_align restricts hits to offsets divisible by it "
+        "(e.g. an 88-byte vertex stride) and max_hits caps the list while "
+        "hits_total keeps counting. This answers 'where in the 1MB vertex "
+        "buffer is the pixel quad' without eyeballing hexdumps.",
+        {"type": "object", "properties": {
+            "buffer_id": {"type": "string"},
+            "pattern": {"description": "Integer (u32), number (f32) or hex "
+                                       "string like '44856000' or '0xCD'"},
+            "type": {"type": "string", "default": "u32",
+                     "description": "u32 | f32 | hex"},
+            "stride_align": {"type": "integer", "default": 1,
+                             "description": "Only report offsets divisible "
+                                            "by this (vertex stride etc.)"},
+            "max_hits": {"type": "integer", "default": 32,
+                         "description": "Max offsets returned (0 = only "
+                                        "count)"},
+            "event_id": {"type": "integer"}},
+         "required": ["buffer_id", "pattern"]}),
+
+    "get_vertex_data": _def(
+        "Decode vertices out of a vertex/instance buffer with a stride-"
+        "aware attribute layout - one row per vertex from start_vertex, "
+        "replacing several get_buffer_data calls plus manual hex offset "
+        "arithmetic (e.g. an 88-byte-stride quad at offsets 4/88/92/96). "
+        "attrs = [{name, byte_offset, type, count?}] with type in f32, f16, "
+        "u32, s32, u16, s16, u8, s8, unorm8x4; count expands an attribute "
+        "to consecutive elements (e.g. a 3-float position).",
+        {"type": "object", "properties": {
+            "buffer_id": {"type": "string"},
+            "start_vertex": {"type": "integer", "default": 0},
+            "count": {"type": "integer", "default": 1,
+                      "description": "How many vertices to decode (cap "
+                                     "4096)"},
+            "stride": {"type": "integer",
+                       "description": "Vertex stride in bytes"},
+            "attrs": {"type": "array",
+                      "items": {"type": "object",
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "byte_offset": {"type": "integer"},
+                                    "type": {"type": "string"},
+                                    "count": {"type": "integer"}}},
+                      "description": "Attribute layout inside one stride"},
+            "event_id": {"type": "integer"}},
+         "required": ["buffer_id", "stride", "attrs"]}),
+
     "get_event_usage": _def(
         "Get every event where a given resource is used (read/written), for "
-        "tracing resource lifetime through the frame.",
+        "tracing resource lifetime through the frame. IMPORTANT limitation: "
+        "host-side persistent/readonly-heap writes (vkMapMemory + memcpy "
+        "without an explicit unmap event) do NOT appear here as events - "
+        "data uploaded that way is only visible in the buffer/texture "
+        "content itself (see get_buffer_regions / buffer_search).",
         {"type": "object", "properties": {
             "resource_id": {"type": "string"}},
          "required": ["resource_id"]}),
@@ -219,17 +310,43 @@ _BASE = {
         "has an 'opened' flag (the capture currently open in the UI); "
         "captures_total gives the count. Note: capture_id is only unique "
         "per connection and restarts at 0 for every launched program - "
-        "match timestamps when older same-id captures may exist.",
+        "match timestamps when older same-id captures may exist. This only "
+        "covers launch_app connections; captures made manually (hotkey) "
+        "are on disk instead - see list_capture_files.",
         {"type": "object", "properties": {}}),
 
     "open_capture": _def(
         "Open a captured frame (by capture_id from list_captures) into the "
         "target instance's UI so the analysis tools can inspect it. Poll "
         "get_current_state until capture_loaded. Unknown ids fail with the "
-        "list of currently available [capture_id -> timestamp] entries.",
+        "list of currently available [capture_id -> timestamp] entries. "
+        "Only captures from a launch_app connection; for manually captured "
+        "frames use open_capture_file(path) instead.",
         {"type": "object", "properties": {
             "capture_id": {"type": "integer"}},
          "required": ["capture_id"]}),
+
+    "open_capture_file": _def(
+        "Load a .rdc capture file from disk into the target instance's UI, "
+        "replacing whatever capture is open - the way to analyze frames "
+        "that were captured MANUALLY (hotkey captures of programs started "
+        "outside this extension): list_capture_files finds the files, this "
+        "tool loads one into an already-running instance instead of "
+        "spawning a new one per frame (unlike start_renderdoc(args=path)), "
+        "so you can step frame23414 -> frame23423 in one instance. Loading "
+        "is asynchronous; with wait_seconds>0 (default) the call waits "
+        "until capture_loaded or reports the failure. frame_number is "
+        "parsed from the ..._frame<N>.rdc filename when present.",
+        {"type": "object", "properties": {
+            "path": {"type": "string",
+                     "description": "Absolute path to a .rdc file (from "
+                                    "list_capture_files)"},
+            "wait_seconds": {"type": "number", "default": 120,
+                             "description": "Wait for the load to finish "
+                                            "(0 = queue it and return "
+                                            "immediately, then poll "
+                                            "get_current_state)"}},
+         "required": ["path"]}),
 
     "close_capture": _def(
         "Remove a capture (by capture_id from list_captures) from the live "
@@ -322,16 +439,19 @@ _BASE = {
 
 # tools that execute inside the broker itself (not routed to an instance)
 BROKER_TOOL_NAMES = ("list_instances", "start_renderdoc",
-                     "shutdown_instance")
+                     "shutdown_instance", "list_capture_files")
 
 _BASE["list_instances"] = _def(
     "List every RenderDoc instance connected to this MCP broker with its "
     "instance id, process id, executable and capture state (pid, "
-    "started_at, last_used, has_capture_connection included). Also reports "
-    "'rd_exe': the qrenderdoc.exe path that start_renderdoc will launch "
-    "(fixed at broker startup). Call this first when several RenderDoc "
-    "windows may be running, then pass the chosen id as the 'instance' "
-    "argument of the other tools.",
+    "started_at, last_used, last_seen, state active/stale, "
+    "has_capture_connection and the open capture's filename/frame_number "
+    "included). Also reports 'rd_exe': the qrenderdoc.exe path that "
+    "start_renderdoc will launch (fixed at broker startup). Call this "
+    "first when several RenderDoc windows may be running, then pass the "
+    "chosen id as the 'instance' argument of the other tools. RenderDoc "
+    "instances that start while the broker is down retry registration "
+    "every 2s and appear here automatically once it is back.",
     {"type": "object", "properties": {}})
 
 _BASE["shutdown_instance"] = _def(
@@ -356,7 +476,11 @@ _BASE["start_renderdoc"] = _def(
     "or RENDERDOC_MCP_RD_EXE environment variable; the path is shown in "
     "the broker startup log and in list_instances' rd_exe field). Once the "
     "new process's renderdoc_mcp extension loads it registers with this "
-    "broker as a new instance that can be driven through the other tools.",
+    "broker as a new instance that can be driven through the other tools. "
+    "The window is shown with SW_SHOWNOACTIVATE so it never steals the "
+    "user's focus. To analyze a .rdc file you can pass it as args "
+    "(\"<path.rdc>\") - but prefer open_capture_file on an existing "
+    "instance to avoid one process per frame.",
     {"type": "object", "properties": {
         "args": {"type": "string",
                  "description": "Optional extra command line for "
@@ -366,6 +490,27 @@ _BASE["start_renderdoc"] = _def(
                          "description": "How long to wait for the new "
                                         "instance to register with this "
                                         "broker (0 = don't wait)"}}})
+
+_BASE["list_capture_files"] = _def(
+    "Enumerate .rdc capture files on disk WITHOUT needing any connected "
+    "RenderDoc instance. RenderDoc writes captures of manually-started "
+    "programs (hotkey captures made outside this extension) into the "
+    "'RenderDoc' folder inside %TEMP% as <app>_<launch timestamp>_frame<N>"
+    ".rdc (or ..._capture.rdc). This is the entry point for analyzing "
+    "manual captures: list files here, then open_capture_file(path) on a "
+    "connected instance (or start_renderdoc with args=\"<path>\") to load "
+    "one. Returns file, app, launch_timestamp, frame_number, size and "
+    "mtime per capture.",
+    {"type": "object", "properties": {
+        "dir": {"type": "string",
+                "description": "Directory to scan (default: the RenderDoc "
+                               "folder inside %TEMP%)"},
+        "name_filter": {"type": "string",
+                        "description": "Case-insensitive substring filter "
+                                       "on the file name"},
+        "max_results": {"type": "integer", "default": 200,
+                        "description": "Cap on returned entries (newest "
+                                       "first)"}}})
 
 
 def _inject_instance(schema):

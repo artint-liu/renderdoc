@@ -40,6 +40,33 @@ class ToolError(Exception):
 # helpers
 # ---------------------------------------------------------------------------
 
+def _temp_capture_dir():
+    """Where RenderDoc writes captures made outside launch_app (hotkey
+    captures of manually-started programs): %TEMP%\\RenderDoc."""
+    return os.path.join(os.environ.get("TEMP", os.getcwd()), "RenderDoc")
+
+
+_NO_CONN_HINT = (
+    "No active capture connection. Call launch_app first. If the frames "
+    "were captured manually (hotkey captures of a program started outside "
+    "this extension), the .rdc files are written to %s - enumerate them "
+    "with list_capture_files and load one with open_capture_file(path) "
+    "(or start_renderdoc with args=\"<path.rdc>\")."
+    % _temp_capture_dir())
+
+
+def _frame_number_from_filename(path):
+    """Parse the frame number out of '<app>_<ts>_frame<N>.rdc' (or
+    '<...>_capture.rdc' -> None). Returns None when not parseable."""
+    base = os.path.basename(str(path))
+    if base.lower().endswith(".rdc"):
+        base = base[:-4]
+    idx = base.rfind("_frame")
+    if idx >= 0 and base[idx + 6:].isdigit():
+        return int(base[idx + 6:])
+    return None
+
+
 def _text_result(obj):
     if isinstance(obj, str):
         text = obj
@@ -60,7 +87,9 @@ def _require_capture():
         loaded = False
     if not loaded:
         raise ToolError("No capture is loaded in this RenderDoc instance. "
-                        "Open a capture first, then retry.")
+                        "Open a capture first, then retry - or load one "
+                        "from disk with open_capture_file(path) (see "
+                        "list_capture_files).")
 
 
 def _rid_from(value):
@@ -679,118 +708,383 @@ def get_shader_disassembly(args):
     return _text_result(disasm)
 
 
+def _resolve_screenshot_target(ctrl, tex_id, eid, output_index, chosen):
+    """Shared by the SaveTexture path and the crop/scale path: pick the
+    texture to screenshot. Returns the resolved ResourceId."""
+    names = _names(ctrl)
+    rid = None
+    if tex_id is not None:
+        rid = _resolve_rid(ctrl, tex_id)
+        chosen["source"] = "texture %s (%s)" % (
+            str(rid), names.get(str(rid), "?"))
+    else:
+        if eid is not None:
+            ctrl.SetFrameEvent(int(eid), True)
+        else:
+            try:
+                ctrl.SetFrameEvent(int(_ctx.CurEvent()), True)
+            except Exception:
+                pass
+        pipe = ctrl.GetPipelineState()
+        outs = []
+        try:
+            outs = [o for o in pipe.GetOutputTargets()
+                    if o.resource != rd.ResourceId()]
+        except Exception:
+            pass
+        if len(outs) > output_index:
+            rid = outs[output_index].resource
+            chosen["source"] = "output %d at current event" % output_index
+        else:
+            try:
+                dt = pipe.GetDepthTarget()
+                if dt.resource != rd.ResourceId():
+                    rid = dt.resource
+                    chosen["source"] = "depth target at current event"
+            except Exception:
+                pass
+        if rid is None:
+            # fall back to the swapchain backbuffer(s)
+            try:
+                for t in ctrl.GetTextures():
+                    if (int(t.creationFlags) &
+                            int(rd.TextureCategory.SwapBuffer)):
+                        rid = t.resourceId
+                        chosen["source"] = "swapchain backbuffer"
+                        break
+            except Exception:
+                pass
+        if rid is not None:
+            chosen["source"] += " (%s)" % names.get(str(rid), "?")
+    if rid is None:
+        raise ToolError(
+            "No bound output target found. Open the event you want in the "
+            "UI, or pass an explicit 'texture_id' (see get_texture_list).")
+    chosen["resource"] = str(rid)
+    chosen["name"] = names.get(str(rid), "?")
+    return rid
+
+
+def _clamp01(v):
+    if v is None or v != v:  # None or NaN
+        return 0.0
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _rgba_crop_scale(ctrl, rid, tex, cx, cy, cw, ch, ow, oh):
+    """Crop (cx, cy, cw, ch) out of texture ``rid`` and nearest-neighbor
+    downscale to (ow, oh), decoded to RGBA8 bytes. Only simple unpacked
+    formats are supported (see _pixel_decoder)."""
+    try:
+        dec, bpp, raw = _pixel_decoder(tex.format)
+    except ToolError:
+        raise ToolError(
+            "region/max_width need a directly decodable texture format "
+            "(UNORM8/UNORM16/SNORM8/FLOAT16/FLOAT32); this texture is %s. "
+            "Use save_to(path) without region/max_width instead (SaveTexture "
+            "handles every format)." % _format_readable(tex.format))
+    n = raw["compCount"]
+    bw = raw["compByteWidth"]
+    ct = raw.get("compType")
+    sub = rd.Subresource()
+    sub.mip = 0
+    sub.slice.sliceIndex = 0
+    data = bytes(ctrl.GetTextureData(rid, sub))
+    tw, th = int(tex.width), int(tex.height)
+    if len(data) < tw * th * bpp:
+        raise ToolError("GetTextureData returned %d bytes, less than the "
+                        "full mip 0 (%d expected for %dx%d)."
+                        % (len(data), tw * th * bpp, tw, th))
+    # nearest-neighbor sample maps (identity when not downscaling)
+    xmap = [cx + (i * cw + ow // 2) // ow for i in range(ow)]
+    ymap = [cy + (j * ch + oh // 2) // oh for j in range(oh)]
+    out = bytearray(ow * oh * 4)
+    fast = bw == 1 and ct in ("UNorm", "UNormSRGB")
+    row_stride = tw * bpp
+    for j in range(oh):
+        sy = ymap[j]
+        srow = sy * row_stride
+        drow = j * ow * 4
+        for i in range(ow):
+            so = srow + xmap[i] * bpp
+            do = drow + i * 4
+            if fast and n == 4:
+                out[do:do + 4] = data[so:so + 4]
+            elif fast:
+                r = data[so]
+                g = data[so + 1] if n > 1 else r
+                b = data[so + 2] if n > 2 else r
+                out[do] = r
+                out[do + 1] = g
+                out[do + 2] = b
+                out[do + 3] = 255
+            else:
+                vals = dec(data[so:so + bpp])
+                v0 = int(_clamp01(vals[0]) * 255.0 + 0.5)
+                v1 = int(_clamp01(vals[1]) * 255.0 + 0.5) if n > 1 else v0
+                v2 = int(_clamp01(vals[2]) * 255.0 + 0.5) if n > 2 else v0
+                v3 = int(_clamp01(vals[3]) * 255.0 + 0.5) if n > 3 else 255
+                out[do] = v0
+                out[do + 1] = v1
+                out[do + 2] = v2
+                out[do + 3] = v3
+    return bytes(out), ow, oh
+
+
+try:
+    import binascii as _binascii
+
+    def _crc32(data):
+        return _binascii.crc32(data) & 0xFFFFFFFF
+except ImportError:  # pragma: no cover - binascii ships with base64's dep
+    _CRC_TABLE = None
+
+    def _crc32(data):
+        global _CRC_TABLE
+        if _CRC_TABLE is None:
+            tbl = []
+            for nn in range(256):
+                c = nn
+                for _ in range(8):
+                    c = (c >> 1) ^ (0xEDB88320 if c & 1 else 0)
+                tbl.append(c)
+            _CRC_TABLE = tbl
+        crc = 0xFFFFFFFF
+        for b in data:
+            crc = _CRC_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+        return crc ^ 0xFFFFFFFF
+
+
+try:
+    import zlib as _zlib
+except ImportError:
+    _zlib = None
+
+
+def _adler32(data):
+    """Pure-python Adler-32 (only needed when the zlib module is absent)."""
+    a, b = 1, 0
+    for byte in data:
+        a = (a + byte) % 65521
+        b = (b + a) % 65521
+    return ((b << 16) | a) & 0xFFFFFFFF
+
+
+def _deflate(data):
+    """zlib stream. Real compression when the zlib module exists, otherwise
+    valid stored (uncompressed) deflate blocks."""
+    if _zlib is not None:
+        return _zlib.compress(data, 6)
+    out = bytearray(b"\x78\x01")  # CMF/FLG: 32K window, fastest
+    i = 0
+    n = len(data)
+    while True:
+        blk = data[i:i + 65535]
+        i += len(blk)
+        last = 1 if i >= n else 0
+        ln = len(blk)
+        out.append(0x01 if last else 0x00)  # BFINAL + BTYPE=00 (stored)
+        out += (ln & 0xFFFF).to_bytes(2, "little")
+        out += ((~ln) & 0xFFFF).to_bytes(2, "little")
+        out += blk
+        if last:
+            break
+    out += _adler32(data).to_bytes(4, "big")
+    return bytes(out)
+
+
+_PNG_SIG = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_chunk(tag, payload):
+    ln = len(payload)
+    return (ln.to_bytes(4, "big") + tag + payload +
+            _crc32(tag + payload).to_bytes(4, "big"))
+
+
+def _png_encode(rgba, w, h):
+    """Minimal RGBA8 PNG encoder (no external deps; zlib when available)."""
+    stride = w * 4
+    rows = []
+    for j in range(h):
+        rows.append(b"\x00" + rgba[j * stride:(j + 1) * stride])
+    ihdr = (w.to_bytes(4, "big") + h.to_bytes(4, "big") +
+            bytes(bytearray([8, 6, 0, 0, 0])))  # 8-bit RGBA
+    return (_PNG_SIG + _png_chunk(b"IHDR", ihdr) +
+            _png_chunk(b"IDAT", _deflate(b"".join(rows))) +
+            _png_chunk(b"IEND", b""))
+
+
+def _parse_region_arg(region):
+    """Accept [x, y, w, h] or {x, y, w, h} -> tuple or None."""
+    if region is None or region == "" or region == []:
+        return None
+    try:
+        if isinstance(region, dict):
+            r = (int(region["x"]), int(region["y"]),
+                 int(region["w"]), int(region["h"]))
+        else:
+            vals = [int(v) for v in list(region)]
+            if len(vals) != 4:
+                raise ValueError("need exactly 4 values")
+            r = tuple(vals)
+    except ToolError:
+        raise
+    except Exception:
+        raise ToolError("region must be [x, y, w, h] or {x, y, w, h}")
+    x, y, w, h = r
+    if w <= 0 or h <= 0:
+        raise ToolError("region w/h must be positive (got %dx%d)" % (w, h))
+    if x < 0 or y < 0:
+        raise ToolError("region x/y must be >= 0 (got %d, %d)" % (x, y))
+    return r
+
+
 def get_screenshot(args):
     _require_capture()
     eid = args.get("event_id")
     tex_id = args.get("texture_id")
     output_index = int(args.get("output_index", 0))
-    chosen = {"source": None}
-    if _instance_id:
-        chosen["instance"] = _instance_id
-
-    path = os.path.join(os.environ.get("TEMP", os.getcwd()),
-                        "renderdoc_mcp_shot_%d.png" % os.getpid())
-
-    def work(ctrl):
-        names = _names(ctrl)
-        rid = None
-        if tex_id is not None:
-            rid = _resolve_rid(ctrl, tex_id)
-            chosen["source"] = "texture %s (%s)" % (
-                str(rid), names.get(str(rid), "?"))
-        else:
-            if eid is not None:
-                ctrl.SetFrameEvent(int(eid), True)
-            else:
-                try:
-                    ctrl.SetFrameEvent(int(_ctx.CurEvent()), True)
-                except Exception:
-                    pass
-            pipe = ctrl.GetPipelineState()
-            outs = []
-            try:
-                outs = [o for o in pipe.GetOutputTargets()
-                        if o.resource != rd.ResourceId()]
-            except Exception:
-                pass
-            if len(outs) > output_index:
-                rid = outs[output_index].resource
-                chosen["source"] = "output %d at current event" % output_index
-            else:
-                try:
-                    dt = pipe.GetDepthTarget()
-                    if dt.resource != rd.ResourceId():
-                        rid = dt.resource
-                        chosen["source"] = "depth target at current event"
-                except Exception:
-                    pass
-            if rid is None:
-                # fall back to the swapchain backbuffer(s)
-                try:
-                    for t in ctrl.GetTextures():
-                        if (int(t.creationFlags) &
-                                int(rd.TextureCategory.SwapBuffer)):
-                            rid = t.resourceId
-                            chosen["source"] = "swapchain backbuffer"
-                            break
-                except Exception:
-                    pass
-            if rid is not None:
-                chosen["source"] += " (%s)" % names.get(str(rid), "?")
-        if rid is None:
-            raise ToolError(
-                "No bound output target found. Open the event you want in the "
-                "UI, or pass an explicit 'texture_id' "
-                "(see get_texture_list).")
-        chosen["resource"] = str(rid)
-        chosen["name"] = names.get(str(rid), "?")
-        for t in ctrl.GetTextures():
-            if t.resourceId == rid:
-                chosen["width"] = t.width
-                chosen["height"] = t.height
-                try:
-                    chosen["format"] = t.format.Name()
-                except Exception:
-                    chosen["format"] = "id %d" % int(t.format)
-                break
-        save = rd.TextureSave()
-        save.resourceId = rid
-        save.destType = rd.FileType.PNG
-        save.mip = 0
-        save.slice.sliceIndex = 0
-        save.alpha = rd.AlphaMapping.Preserve
-        result = ctrl.SaveTexture(save, path)
-        chosen["save_result"] = str(result.code)
-        if result.code != rd.ResultCode.Succeeded:
-            raise ToolError("SaveTexture failed: %s (%s)" %
-                            (str(result.code), str(result)))
-
-    _replay_invoke(work)
-
-    chosen["save_result"] = str(chosen.get("save_result", ""))
-    if not os.path.exists(path):
-        # retry with forward slashes (some layers mangle backslash paths)
-        alt = path.replace("\\", "/")
-        if os.path.exists(alt):
-            path = alt
-        else:
-            raise ToolError(
-                "SaveTexture reported success but produced no file at %r "
-                "(cwd=%r, temp exists=%s, result=%s)"
-                % (path, os.getcwd(),
-                   os.path.isdir(os.path.dirname(path)), chosen))
-    with open(path, "rb") as f:
-        data = f.read()
+    region = _parse_region_arg(args.get("region"))
+    max_width = args.get("max_width")
     try:
-        os.remove(path)
-    except OSError:
-        pass
+        max_width = int(max_width) if max_width not in (None, "", 0) else None
+    except (TypeError, ValueError):
+        max_width = None
+    if max_width is not None and max_width <= 0:
+        max_width = None
+    save_to = args.get("save_to")
+    if save_to is not None and str(save_to).strip():
+        save_to = os.path.abspath(
+            os.path.expandvars(os.path.expanduser(str(save_to).strip())))
+        if not save_to.lower().endswith(".png"):
+            save_to += ".png"
+        parent = os.path.dirname(save_to)
+        if parent and not os.path.isdir(parent):
+            try:
+                os.makedirs(parent)
+            except OSError as e:
+                raise ToolError("cannot create save_to directory %s: %s"
+                                % (parent, e))
+    else:
+        save_to = None
+    # crop/scale need raw texture bytes + our own PNG encoder; the plain
+    # SaveTexture path handles every format and writes the full image
+    custom = region is not None or max_width is not None
+    chosen = {"source": None}
+    path = save_to or os.path.join(os.environ.get("TEMP", os.getcwd()),
+                                   "renderdoc_mcp_shot_%d.png" % os.getpid())
+
+    if custom:
+        png_holder = {}
+
+        def work(ctrl):
+            rid = _resolve_screenshot_target(ctrl, tex_id, eid,
+                                             output_index, chosen)
+            tex = None
+            for t in ctrl.GetTextures():
+                if t.resourceId == rid:
+                    tex = t
+                    break
+            if tex is None:
+                raise ToolError("No texture %s found in this capture." % rid)
+            tw, th = int(tex.width), int(tex.height)
+            if region is not None:
+                cx, cy, cw, ch = region
+                if cx + cw > tw or cy + ch > th:
+                    raise ToolError(
+                        "region (%d, %d, %dx%d) is outside texture %s "
+                        "(%dx%d, %s)."
+                        % (cx, cy, cw, ch, rid, tw, th,
+                           chosen.get("name", "?")))
+            else:
+                cx, cy, cw, ch = 0, 0, tw, th
+            ow, oh = cw, ch
+            if max_width is not None and cw > max_width:
+                ow = max_width
+                oh = max(1, (ch * max_width + cw // 2) // cw)
+            png_holder["png"], ow, oh = _rgba_crop_scale(
+                ctrl, rid, tex, cx, cy, cw, ch, ow, oh)
+            chosen["width"] = ow
+            chosen["height"] = oh
+            chosen["region"] = [cx, cy, cw, ch]
+            chosen["max_width"] = max_width
+
+        _replay_invoke(work)
+        png = png_holder["png"]
+        try:
+            with open(path, "wb") as f:
+                f.write(png)
+        except OSError as e:
+            raise ToolError("cannot write %s: %s" % (path, e))
+        chosen["save_result"] = "Succeeded (self-encoded PNG)"
+        if not save_to and len(png) > 8 * 1024 * 1024:
+            raise ToolError("encoded PNG is %.1f MB - too large to inline; "
+                            "use save_to(path) or a smaller max_width."
+                            % (len(png) / 1048576.0))
+    else:
+
+        def work(ctrl):
+            rid = _resolve_screenshot_target(ctrl, tex_id, eid,
+                                             output_index, chosen)
+            for t in ctrl.GetTextures():
+                if t.resourceId == rid:
+                    chosen["width"] = t.width
+                    chosen["height"] = t.height
+                    try:
+                        chosen["format"] = t.format.Name()
+                    except Exception:
+                        chosen["format"] = "id %d" % int(t.format)
+                    break
+            save = rd.TextureSave()
+            save.resourceId = rid
+            save.destType = rd.FileType.PNG
+            save.mip = 0
+            save.slice.sliceIndex = 0
+            save.alpha = rd.AlphaMapping.Preserve
+            result = ctrl.SaveTexture(save, path)
+            chosen["save_result"] = str(result.code)
+            if result.code != rd.ResultCode.Succeeded:
+                raise ToolError("SaveTexture failed: %s (%s)" %
+                                (str(result.code), str(result)))
+
+        _replay_invoke(work)
+
+        chosen["save_result"] = str(chosen.get("save_result", ""))
+        if not os.path.exists(path):
+            # retry with forward slashes (some layers mangle backslash paths)
+            alt = path.replace("\\", "/")
+            if os.path.exists(alt):
+                path = alt
+            else:
+                raise ToolError(
+                    "SaveTexture reported success but produced no file at %r "
+                    "(cwd=%r, temp exists=%s, result=%s)"
+                    % (path, os.getcwd(),
+                       os.path.isdir(os.path.dirname(path)), chosen))
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        raise ToolError("cannot read back %s: %s" % (path, e))
+    if not save_to:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     if not data:
-        raise ToolError("SaveTexture produced an empty file.")
-    text = ("Screenshot of %s: %s (%sx%s %s)" %
+        raise ToolError("screenshot file is empty: %s" % path)
+    text = ("Screenshot of %s: %s (%sx%s %s) -> %s (%d bytes)" %
             (chosen.get("source", "?"), chosen.get("name", "?"),
              chosen.get("width", "?"), chosen.get("height", "?"),
-             chosen.get("format", "?")))
+             chosen.get("format", "?"), path, len(data)))
+    if save_to:
+        return [{"type": "text", "text": text + "; not inlined (save_to)"}]
     return [{"type": "text", "text": text},
             {"type": "image", "data": base64.b64encode(data).decode("ascii"),
              "mimeType": "image/png"}]
@@ -1163,6 +1457,385 @@ def get_buffer_data(args):
     return _text_result(out)
 
 
+# ---------------------------------------------------------------------------
+# buffer understanding: region classification, pattern search, vertex decode.
+# All three fetch raw bytes through GetBufferData in chunks (replay thread)
+# and do the heavy lifting inside the extension so agents never receive
+# multi-megabyte hexdumps.
+# ---------------------------------------------------------------------------
+
+_BUF_CHUNK = 4 << 20  # 4MB GetBufferData reads
+
+
+def _buffer_length(ctrl, rid):
+    try:
+        for b in ctrl.GetBuffers():
+            if b.resourceId == rid:
+                return int(b.length)
+    except Exception:
+        pass
+    return None
+
+
+def _iter_buffer_data(ctrl, rid, total, chunk=_BUF_CHUNK):
+    """Yield the buffer's bytes in chunks. Stops early when RenderDoc
+    returns less than requested (buffer shrunk / unreadable tail)."""
+    off = 0
+    while off < total:
+        n = min(chunk, total - off)
+        data = bytes(ctrl.GetBufferData(rid, off, n))
+        if not data:
+            return
+        yield data
+        off += len(data)
+        if len(data) < n:
+            return
+
+
+# classify every byte: Z = 0x00, C = 0xCD (MSVC debug-heap fill), X = other
+_CLASS_TABLE = bytes.maketrans(
+    bytes(bytearray(range(256))),
+    bytes(bytearray(ord("Z") if v == 0x00 else
+                    (ord("C") if v == 0xCD else ord("X"))
+                    for v in range(256))))
+
+try:
+    import re as _re
+    _RUN_SPLIT = _re.compile(rb"Z+|C+|X+")
+
+    def _runs_of(cls):
+        for m in _RUN_SPLIT.finditer(cls):
+            s, e = m.start(), m.end()
+            yield s, e, cls[s:s + 1]
+except ImportError:  # pragma: no cover - pure-python fallback
+    def _runs_of(cls):
+        n = len(cls)
+        i = 0
+        while i < n:
+            c = cls[i]
+            j = i + 1
+            while j < n and cls[j] == c:
+                j += 1
+            yield i, j, cls[i:i + 1]
+            i = j
+
+
+def get_buffer_regions(args):
+    """REQ-04: classify a buffer into merged same-class byte regions."""
+    _require_capture()
+    rid_arg = args["buffer_id"]
+    eid = args.get("event_id")
+    max_regions = int(args.get("max_regions", 64) or 64)
+    if max_regions < 1:
+        max_regions = 1
+    out = {"buffer": str(rid_arg), "max_regions": max_regions}
+    if _instance_id:
+        out["instance"] = _instance_id
+    regions = []
+    counts = {}
+    first_written = [None]
+    readable = [0]
+
+    def add_region(start, end, cls_char, uniform):
+        if cls_char == b"Z":
+            cls = "0x00"
+        elif cls_char == b"C":
+            cls = "0xCD"
+        elif uniform is not None:
+            cls = "0x%02X" % uniform[0]
+        else:
+            cls = "mixed"
+        counts[cls] = counts.get(cls, 0) + (end - start)
+        if cls != "0x00" and first_written[0] is None:
+            first_written[0] = start
+        regions.append({"byte_offset": start, "byte_length": end - start,
+                        "class": cls})
+
+    def work(ctrl):
+        if eid is not None:
+            ctrl.SetFrameEvent(int(eid), True)
+        rid = _resolve_rid(ctrl, rid_arg)
+        out["buffer"] = str(rid)
+        out["name"] = _names(ctrl).get(str(rid), "?")
+        total = _buffer_length(ctrl, rid)
+        if total is None:
+            raise ToolError("No buffer %s in this capture (see "
+                            "get_buffer_list)." % rid)
+        out["length"] = total
+        if total == 0:
+            return
+        prev = None  # run spanning a chunk boundary: [start, end, cls, uniform]
+        off = 0
+        for data in _iter_buffer_data(ctrl, rid, total):
+            cls = data.translate(_CLASS_TABLE)
+            for s, e, c in _runs_of(cls):
+                uniform = None
+                if c == b"X":
+                    seg = data[s:e]
+                    fb = seg[:1]
+                    if seg.count(fb) == (e - s):
+                        uniform = fb
+                astart, aend = off + s, off + e
+                # a chunk boundary may split one logical run; continue the
+                # previous run whenever the class matches. An X run stays
+                # uniform only if both halves agree on the same byte value;
+                # any disagreement (or either half mixed) merges into a
+                # single 'mixed' region covering both halves.
+                if prev is not None and prev[2] == c:
+                    if c == b"X" and not (prev[3] is not None and
+                                          uniform is not None and
+                                          prev[3] == uniform):
+                        prev[3] = None
+                    prev[1] = aend
+                else:
+                    if prev is not None:
+                        add_region(prev[0], prev[1], prev[2], prev[3])
+                    prev = [astart, aend, c, uniform]
+            off += len(data)
+        readable[0] = off
+        if prev is not None:
+            add_region(prev[0], prev[1], prev[2], prev[3])
+
+    _replay_invoke(work)
+    out["num_regions"] = len(regions)
+    truncated = False
+    if len(regions) > max_regions:
+        truncated = True
+        tail = regions[max_regions - 1:]
+        merged_len = sum(r["byte_length"] for r in tail)
+        regions = regions[:max_regions - 1] + [
+            {"byte_offset": tail[0]["byte_offset"],
+             "byte_length": merged_len, "class": "mixed"}]
+    out["regions"] = regions
+    out["bytes_by_class"] = counts
+    out["first_written_offset"] = first_written[0]
+    if truncated:
+        out["truncated"] = True
+        out["note"] = ("region list truncated at max_regions=%d; raise it or "
+                       "narrow with get_buffer_data" % max_regions)
+    if readable[0] and readable[0] < out.get("length", 0):
+        out["readable_bytes"] = readable[0]
+        out["note"] = ("only %d of %d bytes were readable from the replay" %
+                       (readable[0], out.get("length", 0)))
+    return _text_result(out)
+
+
+def buffer_search(args):
+    """REQ-05: search a buffer for a u32/f32/hex pattern."""
+    _require_capture()
+    rid_arg = args["buffer_id"]
+    eid = args.get("event_id")
+    ptype = str(args.get("type", "u32") or "u32").lower()
+    pattern = args.get("pattern")
+    if pattern is None or (isinstance(pattern, str) and not pattern.strip()):
+        raise ToolError("pattern is required (number for u32/f32, hex "
+                        "string for hex).")
+    if ptype == "u32":
+        try:
+            v = int(pattern)
+        except (TypeError, ValueError):
+            raise ToolError("u32 pattern must be an integer (got %r)"
+                            % (pattern,))
+        pat = (v & 0xFFFFFFFF).to_bytes(4, "little")
+    elif ptype == "f32":
+        try:
+            v = float(pattern)
+        except (TypeError, ValueError):
+            raise ToolError("f32 pattern must be a number (got %r)"
+                            % (pattern,))
+        pat = bytes(bytearray(memoryview(ctypes.c_float(v)).tobytes()))
+    elif ptype == "hex":
+        hs = str(pattern).strip().lower()
+        if hs.startswith("0x"):
+            hs = hs[2:]
+        hs = "".join(hs.split())
+        try:
+            pat = bytes.fromhex(hs)
+        except ValueError as e:
+            raise ToolError("bad hex pattern %r: %s" % (pattern, e))
+    else:
+        raise ToolError("Unknown pattern type %r (valid: u32, f32, hex)"
+                        % ptype)
+    if not pat:
+        raise ToolError("pattern is empty")
+    stride_align = int(args.get("stride_align", 1) or 1)
+    if stride_align < 1:
+        stride_align = 1
+    max_hits = max(int(args.get("max_hits", 32) or 32), 0)
+    out = {"buffer": str(rid_arg), "type": ptype,
+           "pattern_hex": pat.hex(), "pattern_length": len(pat),
+           "stride_align": stride_align, "max_hits": max_hits}
+    if _instance_id:
+        out["instance"] = _instance_id
+    hits = []
+    hits_total = [0]
+    scanned = [0]
+
+    def work(ctrl):
+        if eid is not None:
+            ctrl.SetFrameEvent(int(eid), True)
+        rid = _resolve_rid(ctrl, rid_arg)
+        out["buffer"] = str(rid)
+        out["name"] = _names(ctrl).get(str(rid), "?")
+        total = _buffer_length(ctrl, rid)
+        if total is None:
+            raise ToolError("No buffer %s in this capture (see "
+                            "get_buffer_list)." % rid)
+        out["length"] = total
+        keep = len(pat) - 1
+        carry = b""
+        base = 0  # absolute offset of carry's first byte
+        for data in _iter_buffer_data(ctrl, rid, total):
+            buf = carry + data
+            cstart = base
+            pos = 0
+            while True:
+                i = buf.find(pat, pos)
+                if i < 0:
+                    break
+                pos = i + 1
+                abs_off = cstart + i
+                if abs_off % stride_align:
+                    continue
+                hits_total[0] += 1
+                if max_hits <= 0 or len(hits) < max_hits:
+                    hits.append(abs_off)
+            scanned[0] = cstart + len(buf)
+            base = max(0, scanned[0] - keep)
+            carry = buf[-keep:] if keep else b""
+
+    _replay_invoke(work)
+    out["hits"] = hits
+    out["hits_total"] = hits_total[0]
+    out["scanned_bytes"] = min(out.get("length", 0), scanned[0])
+    if hits_total[0] == 0:
+        out["note"] = ("no hits; the value may not be in this buffer, or is "
+                       "stored in another encoding (try type=f32 for floats)")
+    elif hits_total[0] > len(hits):
+        out["note"] = ("%d hits total, first %d shown; narrow with "
+                       "stride_align/max_hits" % (hits_total[0], len(hits)))
+    return _text_result(out)
+
+
+_ATTR_TYPES = {
+    "f32": (4, "f4"), "float": (4, "f4"),
+    "f16": (2, "f2"), "half": (2, "f2"),
+    "u32": (4, "u4"), "uint": (4, "u4"),
+    "s32": (4, "s4"), "int": (4, "s4"),
+    "u16": (2, "u2"), "s16": (2, "s2"),
+    "u8": (1, "u1"), "s8": (1, "s1"),
+    "unorm8x4": (4, "u8x4"),
+}
+
+
+def _decode_attr_values(atype, count, data):
+    """Decode ``count`` elements of ``atype`` from the start of ``data``."""
+    size, kind = _ATTR_TYPES[atype]
+    need = size * count
+    if len(data) < need:
+        raise ToolError("attribute needs %d bytes but only %d remain"
+                        % (need, len(data)))
+    if kind == "f4":
+        return [_cfloat(data[i * 4:(i + 1) * 4]) for i in range(count)]
+    if kind == "f2":
+        return [_half_to_float(data[i * 2:(i + 1) * 2]) for i in range(count)]
+    if kind == "u4":
+        return [int.from_bytes(data[i * 4:(i + 1) * 4], "little")
+                for i in range(count)]
+    if kind == "s4":
+        return [int.from_bytes(data[i * 4:(i + 1) * 4], "little", signed=True)
+                for i in range(count)]
+    if kind == "u2":
+        return [int.from_bytes(data[i * 2:(i + 1) * 2], "little")
+                for i in range(count)]
+    if kind == "s2":
+        return [int.from_bytes(data[i * 2:(i + 1) * 2], "little", signed=True)
+                for i in range(count)]
+    if kind == "u1":
+        return [int(b) for b in data[:count]]
+    if kind == "s1":
+        return [int.from_bytes(data[i:i + 1], "little", signed=True)
+                for i in range(count)]
+    if kind == "u8x4":
+        return [round(data[0] / 255.0, 6), round(data[1] / 255.0, 6),
+                round(data[2] / 255.0, 6), round(data[3] / 255.0, 6)]
+    raise ToolError("unsupported attr kind %r" % kind)  # pragma: no cover
+
+
+def get_vertex_data(args):
+    """REQ-06: stride-aware vertex/instance data decoding."""
+    _require_capture()
+    rid_arg = args["buffer_id"]
+    stride = int(args.get("stride", 0) or 0)
+    if stride <= 0:
+        raise ToolError("stride must be a positive byte count")
+    start_vertex = max(int(args.get("start_vertex", 0) or 0), 0)
+    count = max(int(args.get("count", 1) or 1), 1)
+    if count > 4096:
+        raise ToolError("count is capped at 4096 vertices per call")
+    attrs_in = args.get("attrs")
+    if not isinstance(attrs_in, list) or not attrs_in:
+        raise ToolError("attrs is required: [{name, byte_offset, type, "
+                        "count?}, ...]")
+    attrs = []
+    max_end = 0
+    for i, a in enumerate(attrs_in):
+        if not isinstance(a, dict):
+            raise ToolError("attrs[%d] must be an object with name/"
+                            "byte_offset/type" % i)
+        name = str(a.get("name") or "attr%d" % len(attrs))
+        boff = int(a.get("byte_offset", 0) or 0)
+        atype = str(a.get("type", "")).lower()
+        if atype not in _ATTR_TYPES:
+            raise ToolError("Unknown attr type %r for %r (valid: %s)"
+                            % (atype, name,
+                               ", ".join(sorted(_ATTR_TYPES))))
+        acount = max(int(a.get("count", 1) or 1), 1)
+        attrs.append({"name": name, "byte_offset": boff, "type": atype,
+                      "count": acount})
+        max_end = max(max_end, boff + _ATTR_TYPES[atype][0] * acount)
+    eid = args.get("event_id")
+    out = {"buffer": str(rid_arg), "stride": stride,
+           "start_vertex": start_vertex, "count": count, "attrs": attrs}
+    if _instance_id:
+        out["instance"] = _instance_id
+    rows = []
+
+    def work(ctrl):
+        if eid is not None:
+            ctrl.SetFrameEvent(int(eid), True)
+        rid = _resolve_rid(ctrl, rid_arg)
+        out["buffer"] = str(rid)
+        out["name"] = _names(ctrl).get(str(rid), "?")
+        total = _buffer_length(ctrl, rid)
+        if total is None:
+            raise ToolError("No buffer %s in this capture (see "
+                            "get_buffer_list)." % rid)
+        out["length"] = total
+        first = start_vertex * stride
+        need = (count - 1) * stride + max_end
+        if first + need > total:
+            raise ToolError(
+                "vertex range needs bytes [%d, %d) but buffer %s is only %d "
+                "bytes (%d vertices at stride %d)."
+                % (first, first + need, rid, total, total // stride, stride))
+        data = bytes(ctrl.GetBufferData(rid, first, need))
+        if len(data) < need:
+            raise ToolError("GetBufferData returned %d of %d bytes"
+                            % (len(data), need))
+        for v in range(count):
+            row_off = v * stride
+            row = {"vertex": start_vertex + v}
+            for a in attrs:
+                row[a["name"]] = _decode_attr_values(
+                    a["type"], a["count"], data[row_off + a["byte_offset"]:])
+            rows.append(row)
+
+    _replay_invoke(work)
+    out["vertices"] = rows
+    return _text_result(out)
+
+
 def get_constant_buffer(args):
     _require_capture()
     eid = int(args["event_id"])
@@ -1294,6 +1967,9 @@ def current_status():
             fn = str(_ctx.GetCaptureFilename())
             if fn:
                 out["capture_filename"] = fn
+                frame = _frame_number_from_filename(fn)
+                if frame is not None:
+                    out["capture_frame_number"] = frame
         except Exception:
             pass
         try:
@@ -1457,7 +2133,7 @@ def launch_app(args):
 def trigger_capture(args):
     """Ask the connected program to capture a frame after a delay."""
     if _conn is None:
-        raise ToolError("No active capture connection. Call launch_app first.")
+        raise ToolError(_NO_CONN_HINT)
     delay = float(args.get("delay_seconds", 0) or 0)
     num = int(args.get("num_frames", 1) or 1)
     _conn.TimedCapture(delay, num)
@@ -1484,7 +2160,7 @@ def capture_and_open(args):
     polling loop into a single call."""
     if _conn is None:
         # same message as trigger_capture so callers can match on it
-        raise ToolError("No active capture connection. Call launch_app first.")
+        raise ToolError(_NO_CONN_HINT)
     delay = float(args.get("delay_seconds", 0) or 0)
     num = int(args.get("num_frames", 1) or 1)
     poll = max(float(args.get("poll_interval_seconds", 0.5) or 0.5), 0.05)
@@ -1579,7 +2255,7 @@ def capture_and_open(args):
 def list_captures(args):
     """List captures made on the active capture connection."""
     if _conn is None:
-        raise ToolError("No active capture connection. Call launch_app first.")
+        raise ToolError(_NO_CONN_HINT)
     out = {"instance": _instance_id,
            "connected": bool(_conn.IsConnected())}
     try:
@@ -1617,7 +2293,7 @@ def list_captures(args):
 def open_capture(args):
     """Open a captured frame from the connection into the RenderDoc UI."""
     if _conn is None:
-        raise ToolError("No active capture connection. Call launch_app first.")
+        raise ToolError(_NO_CONN_HINT)
     cid = int(args["capture_id"])
     # validate up front so a wrong id gets a helpful listing instead of
     # silently opening nothing (capture ids are only unique per connection
@@ -1656,12 +2332,121 @@ def open_capture(args):
                                  "get_current_state until capture_loaded"})
 
 
+def open_capture_file(args):
+    """REQ-02: load a .rdc from disk into this instance's UI (replacing any
+    open capture) - the analysis path for manually captured frames.
+    CaptureContext.LoadCapture must run on the UI thread (it shows the load
+    progress dialog), so it is queued via InvokeOntoUIThread and the load is
+    then polled from this (broker socket) thread."""
+    if _ctx is None:
+        raise ToolError("Extension not initialized yet.")
+    path = str(args.get("path") or "").strip().strip('"')
+    if not path:
+        raise ToolError("path is required (candidates: list_capture_files).")
+    path = os.path.abspath(os.path.expandvars(os.path.expanduser(path)))
+    if not os.path.isfile(path):
+        raise ToolError("Capture file not found: %s. Enumerate candidates "
+                        "with list_capture_files." % path)
+    try:
+        if bool(_ctx.IsCaptureLoading()):
+            raise ToolError("A capture is already loading in this instance; "
+                            "poll get_current_state until capture_loaded "
+                            "before loading another.")
+    except ToolError:
+        raise
+    except Exception:
+        pass
+    out = {"opened": path, "filename": os.path.basename(path)}
+    if _instance_id:
+        out["instance"] = _instance_id
+    fn = _frame_number_from_filename(path)
+    if fn is not None:
+        out["frame_number"] = fn
+    already = False
+    try:
+        cur = str(_ctx.GetCaptureFilename() or "")
+        already = bool(_ctx.IsCaptureLoaded()) and \
+            os.path.normcase(os.path.abspath(cur)) == os.path.normcase(path)
+    except Exception:
+        pass
+    if already:
+        out["capture_loaded"] = True
+        out["note"] = "that file is already open in this instance"
+        return _text_result(out)
+    load_exc = []
+
+    def _do_load():
+        try:
+            # temporary=False => no save/delete prompt when it is closed
+            _ctx.LoadCapture(path, rd.ReplayOptions(), path, False, True)
+        except BaseException as e:  # marshalled back by BlockInvoke-like glue
+            load_exc.append(str(e))
+
+    try:
+        _ctx.InvokeOntoUIThread(_do_load)
+    except Exception as e:
+        raise ToolError("Could not schedule LoadCapture on the UI thread: %s"
+                        % e)
+    try:
+        wait = float(args.get("wait_seconds", 120) or 0)
+    except (TypeError, ValueError):
+        wait = 120.0
+    out["wait_seconds"] = wait
+    if wait <= 0:
+        out["capture_loaded"] = None
+        out["note"] = ("loading queued; poll get_current_state until "
+                       "capture_loaded")
+        return _text_result(out)
+    deadline = time.time() + wait
+    grace = time.time() + 8.0  # UI thread may still be closing the old capture
+    saw_loading = False
+    while True:
+        time.sleep(0.25)
+        loaded = loading = False
+        try:
+            loaded = bool(_ctx.IsCaptureLoaded())
+            loading = bool(_ctx.IsCaptureLoading())
+        except Exception:
+            pass
+        if loaded:
+            out["capture_loaded"] = True
+            break
+        if load_exc:
+            raise ToolError("LoadCapture failed: %s" % load_exc[0])
+        if loading:
+            saw_loading = True
+        elif saw_loading:
+            # the load ran but no capture is loaded: opening failed and
+            # RenderDoc shows an error dialog
+            raise ToolError(
+                "Load attempt finished but no capture is loaded (bad or "
+                "unsupported .rdc?). The RenderDoc UI may show an error "
+                "dialog - close it manually.")
+        if time.time() >= deadline:
+            out["capture_loaded"] = False
+            out["note"] = ("still loading after %.0fs (or the load is stuck "
+                           "behind an error dialog in the RenderDoc UI); "
+                           "poll get_current_state" % wait)
+            return _text_result(out)
+        if not saw_loading and time.time() >= grace:
+            out["capture_loaded"] = False
+            out["note"] = ("load did not start within 8s (the UI thread may "
+                           "be busy); poll get_current_state")
+            return _text_result(out)
+    try:
+        out["capture_filename"] = str(_ctx.GetCaptureFilename())
+    except Exception:
+        pass
+    out["note"] = "capture loaded; the analysis tools are ready"
+    return _text_result(out)
+
+
 def close_capture(args):
     """Remove a capture from the live-capture connection (RenderDoc's
     per-capture removal API is CaptureConnection.DeleteCapture; there is no
     per-capture 'Close'). Deletes the temp capture without prompting."""
     if _conn is None:
-        raise ToolError("No active capture connection. Call launch_app first.")
+        raise ToolError(_NO_CONN_HINT)
     cid = int(args["capture_id"])
     found = None
     try:
@@ -1704,6 +2489,9 @@ TOOL_IMPL = {
     "get_texture_list": get_texture_list,
     "get_buffer_list": get_buffer_list,
     "get_buffer_data": get_buffer_data,
+    "get_buffer_regions": get_buffer_regions,
+    "buffer_search": buffer_search,
+    "get_vertex_data": get_vertex_data,
     "get_constant_buffer": get_constant_buffer,
     "get_event_usage": get_event_usage,
     "get_debug_messages": get_debug_messages,
@@ -1711,6 +2499,7 @@ TOOL_IMPL = {
     "trigger_capture": trigger_capture,
     "list_captures": list_captures,
     "open_capture": open_capture,
+    "open_capture_file": open_capture_file,
     "close_capture": close_capture,
     "capture_and_open": capture_and_open,
     "get_texture_stats": get_texture_stats,

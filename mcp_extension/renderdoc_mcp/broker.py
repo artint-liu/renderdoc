@@ -15,6 +15,7 @@ A Win32 named mutex guarantees exactly one broker per machine.
 import ctypes
 import json
 import os
+import re
 import threading
 import time
 
@@ -80,12 +81,15 @@ class LocalSpoke(object):
         self._status_fn = status_fn
         self.started_at = time.time()
         self.last_used = None
+        self.last_seen = time.time()  # in-process: alive by definition
 
     def call(self, tool, args, timeout=0):
+        self.last_seen = time.time()
         content, is_err = self._dispatch(tool, args)
         return {"content": content, "isError": is_err}
 
     def status(self, timeout=0):
+        self.last_seen = time.time()
         try:
             return self._status_fn()
         except Exception as e:
@@ -109,14 +113,17 @@ class RemoteSpoke(object):
         self._dead = False
         self.started_at = time.time()
         self.last_used = None
+        self.last_seen = time.time()
 
     def _request(self, payload, timeout):
         if self._dead:
             raise BrokerError("instance %s is disconnected" % self.id)
         if not self._lock.acquire(True, timeout):
+            # soft failure: a previous request (possibly a long replay job)
+            # is still running. Do NOT kill the connection.
             raise BrokerError(
-                "instance %s is busy with a previous request (waited %.0fs)"
-                % (self.id, timeout))
+                "instance %s is busy with a previous request (waited %.0fs); "
+                "retry later" % (self.id, timeout))
         try:
             if self._dead:
                 raise BrokerError("instance %s is disconnected" % self.id)
@@ -125,18 +132,39 @@ class RemoteSpoke(object):
             payload = dict(payload)
             payload["id"] = rid
             wire.send_frame(self._sock, payload)
-            if timeout > 0:
-                wire.set_recv_timeout_ms(self._sock, int(timeout * 1000))
-            reply = wire.recv_frame(self._sock)
-            if reply is None:
-                raise BrokerError("instance %s did not answer within %.0fs "
-                                  "(the request may still be running)"
-                                  % (self.id, timeout))
-            if reply.get("type") != "result" or reply.get("id") != rid:
-                raise BrokerError("instance %s protocol desync" % self.id)
-            return reply
+            deadline = time.time() + timeout if timeout > 0 else None
+            if deadline is None:
+                # infinite wait: clear any short timeout a previous request
+                # left on the socket (0 ms = block indefinitely on Windows)
+                wire.set_recv_timeout_ms(self._sock, 0)
+            while True:
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        # soft failure: the request may still complete on
+                        # the instance; the late reply is dropped as stale
+                        # by a future request instead of killing the link
+                        raise BrokerError(
+                            "instance %s did not answer within %.0fs (the "
+                            "request may still be running; retry later)"
+                            % (self.id, timeout))
+                    ms = int(remaining * 1000)
+                    if ms < 1:
+                        ms = 1  # 0 would mean an infinite SO_RCVTIMEO
+                    wire.set_recv_timeout_ms(self._sock, ms)
+                reply = wire.recv_frame(self._sock)
+                if reply is None:
+                    if deadline is None:
+                        continue
+                    continue  # loop re-checks the deadline above
+                self.last_seen = time.time()
+                if reply.get("type") == "result" and reply.get("id") == rid:
+                    return reply
+                # stale reply from an earlier soft-timed-out request (or an
+                # unexpected frame): drop it and keep waiting for ours
         except BrokerError:
-            self._kill("request failed")
+            # soft errors keep the connection alive; only true disconnects
+            # (wire raises ConnectionClosed/OSError) get cleaned up below
             raise
         except Exception as e:
             self._kill("request failed")
@@ -186,7 +214,7 @@ class RemoteSpoke(object):
 
 class Broker(object):
     def __init__(self, http_port=30007, reg_port=30008, log_cb=None,
-                 name="renderdoc-mcp", version="0.3.0", rd_exe=None,
+                 name="renderdoc-mcp", version="0.4.0", rd_exe=None,
                  rd_exe_source=None, on_quit=None):
         self._http_port = http_port
         self._reg_port = reg_port
@@ -208,10 +236,14 @@ class Broker(object):
         self._http = None
         self._reg_listen = None
         self._reg_thread = None
+        self._lastseen_thread = None
         self._stop = False
         self._mutex = None
         self._call_timeout = _env_float("RENDERDOC_MCP_CALL_TIMEOUT", 300.0)
         self._status_timeout = _env_float("RENDERDOC_MCP_STATUS_TIMEOUT", 8.0)
+        self._stale_after = _env_float("RENDERDOC_MCP_STALE_AFTER", 120.0)
+        self._lastseen_interval = _env_float(
+            "RENDERDOC_MCP_LASTSEEN_INTERVAL", 30.0)
 
     @property
     def url(self):
@@ -252,6 +284,8 @@ class Broker(object):
                 entry["call"] = self._tool_start_renderdoc
             elif name == "shutdown_instance":
                 entry["call"] = self._tool_shutdown_instance
+            elif name == "list_capture_files":
+                entry["call"] = self._tool_list_capture_files
             else:
                 entry["call"] = (lambda n:
                                  lambda args: self._route(n, args))(name)
@@ -267,6 +301,9 @@ class Broker(object):
             raise
         self._reg_thread = threading.Thread(target=self._reg_loop, daemon=True)
         self._reg_thread.start()
+        self._lastseen_thread = threading.Thread(target=self._lastseen_loop,
+                                                 daemon=True)
+        self._lastseen_thread.start()
         self._log("[broker] listening: MCP %s | instances 127.0.0.1:%d"
                   % (self.url, self._reg_port))
 
@@ -399,6 +436,30 @@ class Broker(object):
                     pass
         threading.Thread(target=_finish, daemon=True).start()
 
+    def _lastseen_loop(self):
+        """REQ-08: keep last_seen fresh for quiet remote instances. A status
+        probe that times out is soft (RemoteSpoke no longer kills the
+        connection on timeouts), so probing never disconnects a busy
+        instance; a dead socket still unregisters it via the request path."""
+        interval = max(self._lastseen_interval, 5.0)
+        probe_timeout = min(self._status_timeout, 6.0)
+        while not self._stop:
+            time.sleep(interval)
+            if self._stop:
+                return
+            now = time.time()
+            for s in self._snapshot():
+                if self._stop:
+                    return
+                if not s.remote or now - s.last_seen < interval * 2.0:
+                    continue
+                try:
+                    st = s.status(timeout=probe_timeout)
+                    if st.get("reachable"):
+                        s.last_seen = time.time()
+                except Exception:
+                    pass
+
     # -- routing -----------------------------------------------------------
 
     def _snapshot(self):
@@ -412,7 +473,12 @@ class Broker(object):
             raise BrokerError(
                 "No RenderDoc instance is connected to this MCP broker. "
                 "Start qrenderdoc (the renderdoc_mcp extension connects "
-                "automatically) or call start_renderdoc.")
+                "automatically) or call start_renderdoc. Manually started "
+                "instances keep retrying registration every 2s and appear "
+                "once the broker is up. Meanwhile, captures made manually "
+                "can be listed with list_capture_files (%TEMP%\\RenderDoc) "
+                "and analyzed once any instance is available via "
+                "open_capture_file.")
         if inst is not None and str(inst).strip() != "":
             key = str(inst).strip()
             for s in spokes:
@@ -460,6 +526,82 @@ class Broker(object):
 
     # -- broker-local tools --------------------------------------------------
 
+    _CAPTURE_FILE_RE = re.compile(
+        r"^(?P<app>.+)_(?P<ts>\d{4}\.\d{2}\.\d{2}_\d{2}\.\d{2}\.\d{2})"
+        r"_(?P<cap>frame\d+|capture)\.rdc$", re.IGNORECASE)
+
+    def _tool_list_capture_files(self, args):
+        """REQ-01: enumerate .rdc captures on disk without any instance."""
+        args = dict(args or {})
+        d = str(args.get("dir") or "").strip().strip('"')
+        if d:
+            d = os.path.abspath(os.path.expandvars(os.path.expanduser(d)))
+        else:
+            d = os.path.join(os.environ.get("TEMP", os.getcwd()),
+                             "RenderDoc")
+        name_filter = str(args.get("name_filter") or "").lower()
+        try:
+            max_results = int(args.get("max_results", 200) or 200)
+        except (TypeError, ValueError):
+            max_results = 200
+        if max_results < 1:
+            max_results = 1
+        if not os.path.isdir(d):
+            raise BrokerError(
+                "Directory not found: %s. RenderDoc creates the 'RenderDoc' "
+                "folder inside %%TEMP%% when the first capture is written; "
+                "pass 'dir' to scan a custom location (qrenderdoc's "
+                "TemporaryCaptureDirectory setting can also move it)."
+                % d)
+        try:
+            names = os.listdir(d)
+        except OSError as e:
+            raise BrokerError("cannot list %s: %s" % (d, e))
+        rdc_names = [n for n in names if n.lower().endswith(".rdc")]
+        if name_filter:
+            rdc_names = [n for n in rdc_names if name_filter in n.lower()]
+        entries = []
+        for n in rdc_names:
+            p = os.path.join(d, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            e = {"file": p, "name": n, "size": int(st.st_size),
+                 "mtime": _iso_time(st.st_mtime),
+                 "app": None, "launch_timestamp": None,
+                 "frame_number": None, "capture_type": "unknown"}
+            m = self._CAPTURE_FILE_RE.match(n)
+            if m:
+                e["app"] = m.group("app")
+                e["launch_timestamp"] = m.group("ts")
+                cap = m.group("cap").lower()
+                if cap.startswith("frame"):
+                    e["frame_number"] = int(cap[5:])
+                    e["capture_type"] = "frame"
+                else:
+                    e["capture_type"] = "trigger"
+            entries.append((st.st_mtime, e))
+        entries.sort(key=lambda t: t[0], reverse=True)  # newest first
+        total = len(entries)
+        out = {"dir": d, "count": total,
+               "captures": [e for _, e in entries[:max_results]]}
+        if total > max_results:
+            out["truncated"] = True
+            out["note"] = ("showing the %d newest of %d captures; narrow "
+                           "with name_filter" % (max_results, total))
+        else:
+            out["note"] = ("load one into an instance with "
+                           "open_capture_file(path), or start_renderdoc "
+                           "with args=\"<path>\" when no instance is "
+                           "connected")
+        if not total:
+            out["note"] = ("no .rdc files here yet. Captures of "
+                           "manually-started programs appear here after the "
+                           "hotkey capture; captures made via launch_app "
+                           "show up in list_captures instead")
+        return tool_defs.text_result(out)
+
     def _tool_list_instances(self, args):
         spokes = self._snapshot()
         results = [None] * len(spokes)
@@ -492,6 +634,16 @@ class Broker(object):
             out["started_at"] = _iso_time(s.started_at)
             out["last_used"] = _iso_time(s.last_used) \
                 if s.last_used is not None else None
+            # REQ-08: last_seen = freshest sign of life (any reply frame or
+            # probe); state flags stale instances for multi-instance triage
+            out["last_seen"] = _iso_time(s.last_seen) \
+                if s.last_seen is not None else None
+            if s.last_seen is None:
+                out["state"] = "active"
+            else:
+                out["state"] = ("active"
+                                if time.time() - s.last_seen <=
+                                self._stale_after else "stale")
             # has_capture_connection: whether a launched program is still
             # connected to that instance (from the spoke status if reported)
             out["has_capture_connection"] = st.get("app_connected")
@@ -589,9 +741,12 @@ class Broker(object):
         # let the child's extension find THIS broker even on custom ports
         child_env = {"RENDERDOC_MCP_PORT": str(self._http_port),
                      "RENDERDOC_MCP_REG_PORT": str(self._reg_port)}
-        pid = winprocess.spawn(exe, extra, workdir, extra_env=child_env)
+        # REQ-09.3: SW_SHOWNOACTIVATE so the new window never steals focus
+        pid = winprocess.spawn(exe, extra, workdir, extra_env=child_env,
+                               no_activate=True)
         out = {"started": True, "pid": pid, "exe": exe,
-               "exe_source": self._rd_exe_source, "endpoint": self.url}
+               "exe_source": self._rd_exe_source, "endpoint": self.url,
+               "no_activate": True}
         if wait_seconds > 0:
             deadline = time.time() + wait_seconds
             found = None
