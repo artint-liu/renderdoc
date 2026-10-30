@@ -234,6 +234,13 @@ def _f6v(values, count=4):
         return [None] * count
 
 
+def _mv_px(mv):
+    """ModificationValue -> PixelValue. Newer RenderDoc API wraps the color
+    in a ``col`` member; the old API had floatValue directly on the struct."""
+    col = getattr(mv, "col", None)
+    return col if col is not None else mv
+
+
 def _int_or_none(v):
     try:
         return int(v)
@@ -315,7 +322,8 @@ def _pixel_value_compact(v):
     from the float ones)."""
     out = {}
     try:
-        out["floatValue"] = [_f6(x) for x in list(v.floatValue)[:4]]
+        px = _mv_px(v)
+        out["floatValue"] = [_f6(x) for x in list(px.floatValue)[:4]]
     except Exception as e:
         out["floatValue_err"] = str(e)
     try:
@@ -858,9 +866,9 @@ def get_pixel_history(args):
                              "passed": bool(r.Passed()),
                              "rejected_by": rejects,
                              "unboundPS": bool(r.unboundPS),
-                             "shader_out": _f6v(r.shaderOut.floatValue),
-                             "pre_mod": _f6v(r.preMod.floatValue),
-                             "post_mod": _f6v(r.postMod.floatValue),
+                             "shader_out": _f6v(_mv_px(r.shaderOut).floatValue),
+                             "pre_mod": _f6v(_mv_px(r.preMod).floatValue),
+                             "post_mod": _f6v(_mv_px(r.postMod).floatValue),
                              "depth_in": _f6(r.preMod.depth),
                              "depth_out": _f6(r.postMod.depth),
                              "stencil_in": _int_or_none(r.preMod.stencil),
@@ -1051,6 +1059,30 @@ def compare_regions(args):
             _f6(over / float(n_px)) if n_px else None
     return _text_result(out)
     _require_capture()
+    max_results = int(args.get("max_results", 500))
+    name_filter = str(args.get("name_filter", "")).lower()
+    texs = []
+
+    def work(ctrl):
+        names = _names(ctrl)
+        for t in ctrl.GetTextures():
+            nm = names.get(str(t.resourceId), "")
+            if name_filter and name_filter not in nm.lower():
+                continue
+            texs.append({"resource_id": str(t.resourceId), "name": nm,
+                         "width": t.width, "height": t.height,
+                         "depth": t.depth, "format": str(t.format),
+                         "mips": t.mips, "arraysize": t.arraysize})
+            if len(texs) >= max_results:
+                break
+
+    _replay_invoke(work)
+    return _text_result({"count": len(texs), "textures": texs})
+
+
+def get_texture_list(args):
+    _require_capture()
+
     max_results = int(args.get("max_results", 500))
     name_filter = str(args.get("name_filter", "")).lower()
     texs = []
@@ -1542,6 +1574,9 @@ def capture_and_open(args):
                    "with the same id may exist, tell them apart by "
                    "timestamp (reported above).")
     return _text_result(out)
+
+
+def list_captures(args):
     """List captures made on the active capture connection."""
     if _conn is None:
         raise ToolError("No active capture connection. Call launch_app first.")

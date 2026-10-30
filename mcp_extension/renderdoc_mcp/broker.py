@@ -187,12 +187,16 @@ class RemoteSpoke(object):
 class Broker(object):
     def __init__(self, http_port=30007, reg_port=30008, log_cb=None,
                  name="renderdoc-mcp", version="0.3.0", rd_exe=None,
-                 rd_exe_source=None):
+                 rd_exe_source=None, on_quit=None):
         self._http_port = http_port
         self._reg_port = reg_port
         self._log = log_cb if log_cb is not None else (lambda m: None)
         self._name = name
         self._version = version
+        # called after the broker stopped because a "quit" frame arrived on
+        # the registration port (rdmcp_broker.py --quit); None in RD-hosted
+        # mode (the hosting instance just stops serving)
+        self._on_quit = on_quit
         # qrenderdoc.exe to launch, fixed at startup: --exe arg > env var
         # (see rdmcp_broker.py); the RD-hosted broker falls back to the
         # hosting qrenderdoc when neither is set (try_host_broker)
@@ -341,7 +345,22 @@ class Broker(object):
     def _handshake(self, sock):
         try:
             frame = wire.recv_frame(sock)
-            if not frame or frame.get("type") != "register":
+            if not frame:
+                wire.close(sock)
+                return
+            if frame.get("type") == "quit":
+                # graceful remote shutdown (rdmcp_broker.py --quit): ack
+                # first, then take the endpoint down in the background so
+                # this reply reliably gets out
+                self._log("[broker] quit requested via registration port")
+                try:
+                    wire.send_frame(sock, {"type": "bye"})
+                except Exception:
+                    pass
+                wire.close(sock)
+                self._shutdown_from_quit()
+                return
+            if frame.get("type") != "register":
                 wire.close(sock)
                 return
             meta = dict((k, frame.get(k))
@@ -364,6 +383,21 @@ class Broker(object):
         except Exception as e:
             self._log("[broker] registration handshake failed: %s" % e)
             wire.close(sock)
+
+    def _shutdown_from_quit(self):
+        def _finish():
+            time.sleep(0.2)  # let the quit ack flush before ports go down
+            try:
+                self.stop()
+            except Exception:
+                pass
+            cb = self._on_quit
+            if cb is not None:
+                try:
+                    cb()
+                except Exception:
+                    pass
+        threading.Thread(target=_finish, daemon=True).start()
 
     # -- routing -----------------------------------------------------------
 
