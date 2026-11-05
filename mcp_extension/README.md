@@ -3,7 +3,7 @@
 一个 qrenderdoc UI 扩展：在 **Tools → RenderDoc MCP Server** 菜单中启动一个可见的服务窗口，
 通过 MCP（Model Context Protocol，Streamable HTTP）向 AI Agent 暴露当前打开抓帧的分析能力。
 
-当前版本 **v0.4.0**（broker 一机一实例 + 多 RenderDoc 实例注册路由）。
+当前版本 **v0.4.1**（broker 一机一实例 + 多 RenderDoc 实例注册路由；关闭/换帧不再弹保存框）。
 
 ## 自测
 
@@ -40,6 +40,39 @@ Broker 级工具（无需实例连接）：`list_instances`、`start_renderdoc`�
 
 抓帧控制：`launch_app` → `trigger_capture` / `capture_and_open` →
 `list_captures` / `open_capture` / `close_capture`。
+
+### 关闭 / 换帧不再弹「保存截帧」对话框
+
+qrenderdoc 的 `Unsaved capture / Save this capture?` 与
+`Save changes to capture?` 都出自 `MainWindow::PromptCloseCapture()`：
+凡是走 UI 的关闭路径（File→Close、打开另一帧、退出程序）都会先弹模态框，
+UI 线程被占住 → MCP 调用卡住、必须人工点一下。
+
+本扩展现在一律走 Python 侧的 `CaptureContext.CloseCapture()`（SWIG 包装会
+同步切到 UI 线程执行），它**不经过**该提示，等价于自动点 "No"：
+
+- `close_capture()` — 不传 `capture_id` 即关闭当前 UI 里打开的截帧；
+  `discard=true`（默认）显式不保存，`save_to=<path>` 则先保存再关。
+  传 `capture_id` 仍是原来的「从连接删除该帧」（`DeleteCapture`）。
+  `discard=false` 且未给 `save_to` 会直接报错，绝不退回弹窗。
+- `open_capture` / `capture_and_open` — 换帧前自动静默关闭旧帧；
+- `open_capture_file` — 本来就是静默替换（`LoadCapture(temporary=False)`）；
+- `shutdown_instance` — 退出前先静默关闭，不再被保存框挡住后强杀。
+
+```json
+close_capture      {"instance": "rd1", "discard": true}
+close_capture      {"instance": "rd1", "save_to": "D:\\caps\\frame42.rdc"}
+open_capture       {"instance": "rd1", "capture_id": 3}
+shutdown_instance  {"instance": "rd1", "save_to": "D:\\caps\\last.rdc"}
+```
+
+默认「不保存」会丢弃书签 / 注释 / 重命名等未落盘修改；临时抓帧的 `.rdc`
+由 RenderDoc 自己删除（与 UI 里点 "No" 一致）。要保留就给 `save_to`
+（目录必须已存在，否则拒绝，避免 RenderDoc 再弹错误框）。
+
+如果当前已经卡在旧版本弹出的对话框里：手动点一次 "No"，或用
+`shutdown_instance` 让 broker 在 5 秒后强杀该实例再 `start_renderdoc`
+拉起新实例；升级扩展后不会再出现。
 
 ### 手动抓帧分析（REQ-01/02/03）
 

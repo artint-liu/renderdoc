@@ -1950,6 +1950,94 @@ _opened_capture = None  # {capture_id, frame_number, timestamp} of the
                         # capture_and_open (REQ-08/REQ-11)
 
 
+# ---------------------------------------------------------------------------
+# silent capture close: never show RenderDoc's "Save this capture?" /
+# "Save changes to capture?" modal dialog (both live in
+# MainWindow::PromptCloseCapture(), which *all* UI close paths run through).
+# Our pyrenderdoc object is the underlying CaptureContext: CloseCapture()
+# bypasses that dialog, and the SWIG invoker marshals it onto the UI thread
+# and blocks until done. Calling it directly == clicking "No" unattended.
+# ---------------------------------------------------------------------------
+
+def _save_to_path(args):
+    """Normalize the shared save_to argument. None/empty => do not save."""
+    p = args.get("save_to")
+    if p is None:
+        return None
+    p = str(p).strip().strip('"')
+    if not p:
+        return None
+    return os.path.abspath(os.path.expandvars(os.path.expanduser(p)))
+
+
+def _save_capture(save_to):
+    """Save the open capture first (so bookmarks/notes/renames are kept).
+
+    SaveCaptureTo() opens a modal error box on failure, so verify the target
+    directory up front and keep bad paths away from the UI thread entirely.
+    """
+    parent = os.path.dirname(save_to)
+    if not os.path.isdir(parent):
+        raise ToolError("save_to directory does not exist: %s (create it "
+                        "first; a failed save would open a modal error "
+                        "dialog in RenderDoc)" % parent)
+    try:
+        ok = bool(_ctx.SaveCaptureTo(save_to))
+    except Exception as e:
+        raise ToolError("SaveCaptureTo failed: %s" % e)
+    if not ok:
+        raise ToolError("SaveCaptureTo(%s) returned false; the capture was "
+                        "kept open" % save_to)
+
+
+def _close_loaded_capture(save_to=None):
+    """Close the capture open in the UI without any prompt.
+
+    save_to given: save to that path first; otherwise discard all unsaved
+    modifications (RenderDoc deletes a temporary live-capture .rdc itself).
+    Returns a small status dict; never raises for 'nothing is open'.
+    """
+    if _ctx is None:
+        raise ToolError("Extension not initialized yet.")
+    try:
+        if bool(_ctx.IsCaptureLoading()):
+            raise ToolError("A capture is still loading in this instance; "
+                            "poll get_current_state until capture_loaded "
+                            "before closing or switching captures.")
+    except ToolError:
+        raise
+    except Exception:
+        pass
+    try:
+        loaded = bool(_ctx.IsCaptureLoaded())
+    except Exception:
+        loaded = False
+    out = {"capture_was_loaded": loaded, "closed": False}
+    if not loaded:
+        return out
+    try:
+        out["capture_filename"] = str(_ctx.GetCaptureFilename())
+    except Exception:
+        pass
+    try:
+        out["modifications"] = str(_ctx.GetCaptureModifications())
+    except Exception:
+        pass
+    if save_to:
+        _save_capture(save_to)
+        out["saved_to"] = save_to
+    try:
+        _ctx.CloseCapture()
+    except Exception as e:
+        raise ToolError("CloseCapture failed: %s" % e)
+    global _opened_capture
+    _opened_capture = None
+    out["closed"] = True
+    out["unsaved_changes"] = "saved" if save_to else "discarded"
+    out["save_prompt"] = "bypassed"
+    return out
+
+
 def current_status():
     """Cheap, exception-safe status dict for list_instances /
     get_current_state. No replay-thread round-trip: only reads UI state, so
@@ -2015,11 +2103,21 @@ def shutdown_instance(args):
     """Spoke side of the broker's shutdown_instance: request a graceful
     close of THIS qrenderdoc (main-window close scheduled on the UI
     thread). Returns immediately; the broker waits for process exit and
-    force-kills if the graceful path does not finish in time."""
+    force-kills if the graceful path does not finish in time.
+
+    MainWindow::closeEvent() calls PromptCloseCapture(), so any open capture
+    must be closed *silently* here first (default: discard unsaved changes,
+    optional save_to keeps them) - otherwise the exit stops on a modal
+    save dialog and the broker force-kills the process."""
     out = {"pid": os.getpid(), "graceful_requested": False}
     if _ctx is None:
         out["note"] = "extension context not available; broker will kill"
         return _text_result(out)
+    save_to = _save_to_path(args)
+    try:
+        out["capture_close"] = _close_loaded_capture(save_to)
+    except Exception as e:
+        out["capture_close_error"] = str(e)
     try:
         widget = _ctx.GetMainWindow().Widget()
     except Exception:
@@ -2030,8 +2128,10 @@ def shutdown_instance(args):
             _ctx.InvokeOntoUIThread(lambda c=closer: c())
             out["graceful_requested"] = True
             out["note"] = ("main window close requested on the UI thread; "
-                           "if a save prompt blocks it the broker force-"
-                           "kills after its grace period")
+                           "the open capture was closed first with no save "
+                           "prompt (unsaved changes %s)"
+                           % ("saved to " + save_to if save_to
+                              else "discarded"))
         except Exception as e:
             out["note"] = "could not schedule window close: %s" % e
     else:
@@ -2202,8 +2302,12 @@ def capture_and_open(args):
                         "presents frames." % (timeout, timeout))
     cid, ts, frame_no, api = chosen
 
-    # phase 2: open it and wait until the capture is ready in the UI
+    # phase 2: open it and wait until the capture is ready in the UI.
+    # CaptureConnection.OpenCapture() runs through MainWindow::LoadCapture(),
+    # which prompts to save the previously open capture. Close that one
+    # silently first so no modal dialog can block the UI thread.
     open_deadline = time.time() + timeout
+    previous = _close_loaded_capture(_save_to_path(args))
     _conn.OpenCapture(cid)
     while True:
         time.sleep(poll)
@@ -2242,7 +2346,9 @@ def capture_and_open(args):
     _replay_invoke(work)
     out = {"capture_id": cid, "frame_number": frame_no, "timestamp": ts,
            "api": api, "num_actions": num_actions[0],
-           "first_actions": out_actions}
+           "first_actions": out_actions,
+           "previous_capture_closed": previous["closed"],
+           "save_prompt": "bypassed" if previous["closed"] else "not needed"}
     if _instance_id:
         out["instance"] = _instance_id
     out["note"] = ("capture_id is only unique per connection and restarts "
@@ -2320,6 +2426,11 @@ def open_capture(args):
                         "for each launched program - match timestamps, not "
                         "ids, when older captures may be listed)."
                         % (cid, avail))
+    # CaptureConnection.OpenCapture() goes through MainWindow::LoadCapture(),
+    # which would pop "Save this capture?" / "Save changes to capture?" for
+    # the previously open frame. Close it here with CloseCapture() instead:
+    # silent, no prompt, unsaved changes discarded (or saved to save_to).
+    previous = _close_loaded_capture(_save_to_path(args))
     _conn.OpenCapture(cid)
     global _opened_capture
     _opened_capture = {"capture_id": cid,
@@ -2328,6 +2439,9 @@ def open_capture(args):
     return _text_result({"instance": _instance_id, "opened": cid,
                          "frame_number": int(found.frameNumber),
                          "timestamp": str(found.timestamp),
+                         "previous_capture_closed": previous["closed"],
+                         "save_prompt": "bypassed" if previous["closed"]
+                                        else "not needed",
                          "note": "capture is loading into the UI; poll "
                                  "get_current_state until capture_loaded"})
 
@@ -2373,6 +2487,18 @@ def open_capture_file(args):
         out["capture_loaded"] = True
         out["note"] = "that file is already open in this instance"
         return _text_result(out)
+    # LoadCapture() replaces the open capture silently (it calls
+    # CaptureContext::CloseCapture(), not MainWindow::PromptCloseCapture()).
+    # save_to lets callers keep the old capture's unsaved edits first.
+    save_to = _save_to_path(args)
+    if save_to:
+        try:
+            loaded = bool(_ctx.IsCaptureLoaded())
+        except Exception:
+            loaded = False
+        if loaded:
+            _save_capture(save_to)
+            out["previous_capture_saved_to"] = save_to
     load_exc = []
 
     def _do_load():
@@ -2442,12 +2568,50 @@ def open_capture_file(args):
 
 
 def close_capture(args):
-    """Remove a capture from the live-capture connection (RenderDoc's
-    per-capture removal API is CaptureConnection.DeleteCapture; there is no
-    per-capture 'Close'). Deletes the temp capture without prompting."""
+    """Close the capture open in the UI without a save prompt (default:
+    discard unsaved changes), and/or remove a live-connection entry.
+
+    capture_id omitted -> close whatever is open in this instance's UI; no
+                          connection is needed (also works for captures
+                          loaded with open_capture_file).
+    capture_id given   -> original behaviour: CaptureConnection.DeleteCapture
+                          (also closes it in the UI when it is the open one).
+
+    discard (default true) and save_to are the explicit "do not save"
+    controls. This tool NEVER opens RenderDoc's modal save dialog, so
+    discard=false without save_to is rejected instead of falling back to a
+    prompt that would need a human click.
+    """
+    global _opened_capture
+    save_to = _save_to_path(args)
+    discard = args.get("discard", True)
+    if isinstance(discard, str):
+        discard = discard.strip().lower() not in ("false", "0", "no", "off")
+    discard = bool(discard)
+    if not discard and not save_to:
+        raise ToolError("discard=false requires save_to=<path>. This tool "
+                        "never opens RenderDoc's modal save dialog; pass "
+                        "save_to to keep the capture, or omit both arguments "
+                        "to discard it silently.")
+
+    cid_arg = args.get("capture_id")
+    if cid_arg is None or cid_arg == "":
+        out = {"instance": _instance_id, "discard": discard}
+        out.update(_close_loaded_capture(save_to))
+        if out["closed"]:
+            out["note"] = ("capture closed with NO save prompt (equivalent "
+                           "to clicking 'No'); unsaved changes %s"
+                           % out["unsaved_changes"])
+        else:
+            out["note"] = ("no capture was open in the UI; nothing to close. "
+                           "To remove a live-connection entry pass "
+                           "capture_id (see list_captures).")
+        return _text_result(out)
+
+    # legacy path: remove one entry from the live capture connection
     if _conn is None:
         raise ToolError(_NO_CONN_HINT)
-    cid = int(args["capture_id"])
+    cid = int(cid_arg)
     found = None
     try:
         for c in _conn.GetCaptures():
@@ -2460,17 +2624,24 @@ def close_capture(args):
         raise ToolError("No capture with id %d on the current connection "
                         "(it may already have been deleted). Use "
                         "list_captures for the current list." % cid)
+    saved = None
+    if save_to and _opened_capture is not None and \
+            _opened_capture.get("capture_id") == cid:
+        _save_capture(save_to)
+        saved = save_to
     _conn.DeleteCapture(cid, False)
-    global _opened_capture
     if _opened_capture is not None and \
             _opened_capture.get("capture_id") == cid:
         _opened_capture = None
-    return _text_result({"instance": _instance_id, "closed": cid,
-                         "frame_number": int(found.frameNumber),
-                         "timestamp": str(found.timestamp),
-                         "note": "capture %d removed from the connection "
-                                 "(temp capture deleted without prompting)"
-                                 % cid})
+    out = {"instance": _instance_id, "closed": cid,
+           "frame_number": int(found.frameNumber),
+           "timestamp": str(found.timestamp),
+           "save_prompt": "bypassed",
+           "note": "capture %d removed from the connection "
+                   "(temp capture deleted without prompting)" % cid}
+    if saved:
+        out["saved_to"] = saved
+    return _text_result(out)
 
 
 # ---------------------------------------------------------------------------

@@ -214,7 +214,7 @@ class RemoteSpoke(object):
 
 class Broker(object):
     def __init__(self, http_port=30007, reg_port=30008, log_cb=None,
-                 name="renderdoc-mcp", version="0.4.0", rd_exe=None,
+                 name="renderdoc-mcp", version="0.4.1", rd_exe=None,
                  rd_exe_source=None, on_quit=None):
         self._http_port = http_port
         self._reg_port = reg_port
@@ -667,7 +667,11 @@ class Broker(object):
         self._log("[broker] shutdown_instance %s (pid %s)" % (spoke.id, pid))
         graceful_note = ""
         try:
-            reply = spoke.call("shutdown_instance", {},
+            # forward save_to / discard so the instance can close its open
+            # capture silently instead of stopping on a modal save dialog
+            spoke_args = dict((k, v) for k, v in args.items()
+                              if k != "instance")
+            reply = spoke.call("shutdown_instance", spoke_args,
                                min(self._call_timeout, 15.0))
             if reply.get("isError"):
                 content = reply.get("content") or []

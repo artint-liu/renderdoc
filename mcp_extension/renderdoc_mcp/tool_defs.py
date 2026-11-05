@@ -321,9 +321,16 @@ _BASE = {
         "get_current_state until capture_loaded. Unknown ids fail with the "
         "list of currently available [capture_id -> timestamp] entries. "
         "Only captures from a launch_app connection; for manually captured "
-        "frames use open_capture_file(path) instead.",
+        "frames use open_capture_file(path) instead. Any previously open "
+        "capture is closed silently first (NO save prompt, unsaved changes "
+        "discarded) - pass save_to to keep it instead.",
         {"type": "object", "properties": {
-            "capture_id": {"type": "integer"}},
+            "capture_id": {"type": "integer"},
+            "save_to": {"type": "string",
+                        "description": "Optional absolute .rdc path; save "
+                                       "the currently open capture here "
+                                       "before switching (default: "
+                                       "discard, never prompt)"}},
          "required": ["capture_id"]}),
 
     "open_capture_file": _def(
@@ -336,7 +343,9 @@ _BASE = {
         "so you can step frame23414 -> frame23423 in one instance. Loading "
         "is asynchronous; with wait_seconds>0 (default) the call waits "
         "until capture_loaded or reports the failure. frame_number is "
-        "parsed from the ..._frame<N>.rdc filename when present.",
+        "parsed from the ..._frame<N>.rdc filename when present. Replacing "
+        "a capture is silent (NO save prompt, unsaved changes discarded); "
+        "pass save_to to save the old one before replacing it.",
         {"type": "object", "properties": {
             "path": {"type": "string",
                      "description": "Absolute path to a .rdc file (from "
@@ -345,18 +354,44 @@ _BASE = {
                              "description": "Wait for the load to finish "
                                             "(0 = queue it and return "
                                             "immediately, then poll "
-                                            "get_current_state)"}},
+                                            "get_current_state)"},
+            "save_to": {"type": "string",
+                        "description": "Optional absolute .rdc path; save "
+                                       "the currently open capture here "
+                                       "before replacing it (default: "
+                                       "discard, never prompt)"}},
          "required": ["path"]}),
 
     "close_capture": _def(
-        "Remove a capture (by capture_id from list_captures) from the live "
-        "capture connection so it stops cluttering the list and holds no "
-        "temp file. Implemented with RenderDoc's per-capture removal API "
-        "(CaptureConnection.DeleteCapture, no save prompt); opening "
-        "another capture afterwards is unaffected.",
+        "Close the capture open in the target instance WITHOUT RenderDoc's "
+        "'Save this capture?' / 'Save changes to capture?' modal dialog "
+        "(that dialog otherwise blocks automation until a human clicks). "
+        "Uses CaptureContext.CloseCapture(), which bypasses "
+        "MainWindow::PromptCloseCapture(). Default = discard unsaved "
+        "changes (bookmarks/notes/renames), equivalent to clicking 'No'; "
+        "RenderDoc deletes a temporary live-capture .rdc itself. Omit "
+        "capture_id to just close what is open in the UI (no connection "
+        "needed, also works for captures loaded with open_capture_file); "
+        "pass capture_id to ALSO remove that entry from the live-capture "
+        "connection (original DeleteCapture behaviour). save_to=<path> "
+        "saves before closing so temporary frames/edits are kept. "
+        "discard=false without save_to is rejected: no code path here opens "
+        "the modal save dialog.",
         {"type": "object", "properties": {
-            "capture_id": {"type": "integer"}},
-         "required": ["capture_id"]}),
+            "capture_id": {"type": "integer",
+                           "description": "Optional. Omit to close whatever "
+                                          "is open in the UI; when given, "
+                                          "also delete this live-connection "
+                                          "entry (see list_captures)"},
+            "discard": {"type": "boolean", "default": True,
+                        "description": "Explicit 'do not save'. True "
+                                       "(default) discards unsaved changes "
+                                       "with NO prompt; false requires "
+                                       "save_to"},
+            "save_to": {"type": "string",
+                        "description": "Optional absolute .rdc path; save "
+                                       "the open capture here before "
+                                       "closing (directory must exist)"}}}),
 
     "capture_and_open": _def(
         "One-shot capture: TimedCapture -> wait for the new capture to "
@@ -365,7 +400,9 @@ _BASE = {
         "first_actions}. first_actions holds the first actions_summary "
         "actions of the frame ({event_id, flags, name, numIndices, "
         "numInstances}). Replaces the manual trigger_capture / "
-        "list_captures / open_capture / get_current_state polling loop.",
+        "list_captures / open_capture / get_current_state polling loop. "
+        "Any previously open capture is closed silently first (NO save "
+        "prompt, unsaved changes discarded) - pass save_to to keep it.",
         {"type": "object", "properties": {
             "delay_seconds": {"type": "number", "default": 0},
             "num_frames": {"type": "integer", "default": 1},
@@ -376,7 +413,12 @@ _BASE = {
                                                "wait for load)"},
             "actions_summary": {"type": "integer", "default": 10,
                                 "description": "How many first actions to "
-                                               "include in the summary"}}}),
+                                               "include in the summary"},
+            "save_to": {"type": "string",
+                        "description": "Optional absolute .rdc path; save "
+                                       "the currently open capture here "
+                                       "before switching (default: "
+                                       "discard, never prompt)"}}}),
 
     "get_texture_stats": _def(
         "Numerical statistics of a rectangular region of a texture at an "
@@ -456,10 +498,14 @@ _BASE["list_instances"] = _def(
 
 _BASE["shutdown_instance"] = _def(
     "Gracefully close one RenderDoc instance (main-window close scheduled "
-    "on its UI thread) and remove it from the broker's instance table. If "
-    "the process does not exit within the grace period (e.g. a save prompt "
-    "is blocking), it is force-killed and the response notes method='kill'. "
-    "Other instances and the broker itself are unaffected; when a hosted "
+    "on its UI thread) and remove it from the broker's instance table. "
+    "The capture open in that instance is closed FIRST, silently and "
+    "without RenderDoc's 'Save this capture?' / 'Save changes to capture?' "
+    "modal dialog (unsaved changes discarded by default), so the exit no "
+    "longer needs a human click; pass save_to=<path> to save it before "
+    "closing. If the process still does not exit within the grace period "
+    "it is force-killed and the response notes method='kill'. Other "
+    "instances and the broker itself are unaffected; when a hosted "
     "broker's instance is shut down, another instance takes over the "
     "endpoint.",
     {"type": "object", "properties": {
@@ -468,7 +514,11 @@ _BASE["shutdown_instance"] = _def(
                                     "shown by list_instances (e.g. 'rd1'), "
                                     "or a process id. Required to "
                                     "disambiguate when several are "
-                                    "connected."}},
+                                    "connected."},
+        "save_to": {"type": "string",
+                    "description": "Optional absolute .rdc path; save the "
+                                   "open capture before closing (default: "
+                                   "discard, never prompt)"}},
      "required": ["instance"]})
 
 _BASE["start_renderdoc"] = _def(
