@@ -397,6 +397,14 @@ def _find_action(actions, eid):
     return None
 
 
+def _has_rw(access):
+    """DescriptorAccess.readWrite 在部分 RD API 版本不存在, 防御性访问。"""
+    try:
+        return bool(access.readWrite)
+    except AttributeError:
+        return False
+
+
 def _action_summary(a):
     out = {"event_id": a.eventId, "flags": str(a.flags)}
     name = a.customName
@@ -405,6 +413,16 @@ def _action_summary(a):
         if a.flags & rd.ActionFlags.Drawcall:
             out["numIndices"] = a.numIndices
             out["numInstances"] = a.numInstances
+            # 绘制参数: 索引偏移/顶点基址 (定位共享动态 VB/IB 中实际读取的顶点区间)
+            try:
+                out["indexOffset"] = int(a.indexOffset)
+                out["baseVertex"] = int(a.baseVertex)
+            except Exception:
+                pass
+            try:
+                out["vertexOffset"] = int(a.vertexOffset)
+            except Exception:
+                pass
     except Exception:
         pass
     try:
@@ -610,7 +628,7 @@ def get_drawcall_params(args):
                               "type": str(d.access.type),
                               "index": d.access.index,
                               "arrayElement": bindset,
-                              "readWrite": bool(d.access.readWrite),
+                              "readWrite": _has_rw(d.access),
                               "resource": res,
                               "name": names.get(res, "?")})
         except Exception as e:
@@ -628,6 +646,16 @@ def get_drawcall_params(args):
             out["vertex_buffers"] = vbs
         except Exception as e:
             out["vertex_buffers_err"] = str(e)
+        try:
+            ib = pipe.GetIBuffer()
+            if ib.resourceId != rd.ResourceId():
+                out["index_buffer"] = {"resource": str(ib.resourceId),
+                                       "byteOffset": int(ib.byteOffset),
+                                       "byteStride": int(ib.byteStride),
+                                       "byteSize": int(ib.byteSize),
+                                       "name": names.get(str(ib.resourceId), "?")}
+        except Exception as e:
+            out["index_buffer_err"] = str(e)
         try:
             attrs = []
             for a in pipe.GetVertexInputs():
